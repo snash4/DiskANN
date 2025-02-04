@@ -27,12 +27,12 @@ Server::Server(web::uri &uri, std::vector<std::unique_ptr<diskann::BaseSearch>> 
     {
         _listener->support(std::bind(&Server::handle_post<float>, this, std::placeholders::_1));
     }
-    else if (typestring == std::string("int8_t"))
+    else if (typestring == std::string("int8"))
     {
         _listener->support(web::http::methods::POST,
                            std::bind(&Server::handle_post<int8_t>, this, std::placeholders::_1));
     }
-    else if (typestring == std::string("uint8_t"))
+    else if (typestring == std::string("uint8"))
     {
         _listener->support(web::http::methods::POST,
                            std::bind(&Server::handle_post<uint8_t>, this, std::placeholders::_1));
