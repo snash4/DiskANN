@@ -1,0 +1,39 @@
+{
+  "search_directories": [
+   "/ssd2/nash/anndata/ada"
+  ],
+  "jobs": [
+    {
+      "type": "disk-index",
+      "content": {
+        "source": {
+          "disk-index-source": "Build",
+          "data_type": "float32",
+          "data": "ada_002_1000000_base_vectors.bin",
+          "distance": "squared_l2",
+          "dim": 1536,
+         "max_degree": 64,
+          "l_build": 50,
+          "num_threads": 56,
+          "build_ram_limit_gb": 500.0,
+          "num_pq_chunks": 512,
+          "quantization_type": "SQ_1",
+          "save_path": "/ssd2/nash/workdir/ada/rdisk/disk-index/ada_index_sq"
+        },
+        "search_phase": {
+          "queries": "ada_002_1000000_query_vectors_10000.bin",
+          "groundtruth": "ada_gt10",
+          "search_list": [10, 20, 40, 80, 100, 120],
+          "beam_width": 4,
+          "recall_at": 10,
+          "num_threads": 56,
+          "is_flat_search": false,
+          "num_nodes_to_cache": 50000,
+          "search_io_limit": null,
+          "distance": "squared_l2",
+          "vector_filters_file": null
+        }
+      }
+    }
+  ]
+}

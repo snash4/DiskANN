@@ -1,0 +1,30 @@
+{
+  "search_directories": [
+   "/ssd2/nash/anndata/wikipedia_cohere"
+  ],
+  "jobs": [
+    {
+      "type": "disk-index",
+      "content": {
+        "source": {
+          "disk-index-source": "Load",
+          "data_type": "float32",
+          "load_path": "/ssd2/nash/workdir/wiki10M/rdisk/disk-index/wiki10m"
+        },
+        "search_phase": {
+          "queries": "wikipedia_query.bin",
+          "groundtruth": "wiki10m_gt100",
+          "search_list": [100, 150, 200, 250],
+          "beam_width": 4,
+          "recall_at": 100,
+          "num_threads": 56,
+          "is_flat_search": false,
+          "num_nodes_to_cache": 100000,
+          "search_io_limit": null,
+          "distance": "squared_l2",
+          "vector_filters_file": null
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "search_directories": [
+   "/ssd2/nash/anndata/ada"
+  ],
+  "jobs": [
+    {
+      "type": "disk-index",
+      "content": {
+        "source": {
+          "disk-index-source": "Load",
+          "data_type": "float32",
+          "load_path": "/ssd2/nash/workdir/ada/rdisk/disk-index/ada_index_full"
+        },
+        "search_phase": {
+          "queries": "ada_002_1000000_query_vectors_10000.bin",
+          "groundtruth": "ada_gt50",
+          "search_list": [50, 100,200, 400],
+          "beam_width": 4,
+          "recall_at": 50,
+          "num_threads": 56,
+          "is_flat_search": false,
+          "num_nodes_to_cache": 100000,
+          "search_io_limit": null,
+          "distance": "squared_l2",
+          "vector_filters_file": null
+        }
+      }
+    }
+  ]
+}
