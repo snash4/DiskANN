@@ -268,6 +268,11 @@ pub enum FpBackendSelection {
 /// (`bytemuck` cast — `VectorRepr: VectorElement: bytemuck::Pod` guarantees castability).
 pub(crate) struct GarnetFpStore<T: VectorRepr> {
     pool: Vec<std::sync::Mutex<redis::Connection>>,
+    /// Client + per-call timeout kept for rebuilding a connection after an error: a timed-out sync
+    /// connection is poisoned (the late reply desynchronizes the RESP stream), so `run()` replaces
+    /// it rather than reuse it.
+    client: redis::Client,
+    timeout: std::time::Duration,
     next: std::sync::atomic::AtomicUsize,
     prefix: String,
     breaker: CircuitBreaker,
@@ -317,6 +322,8 @@ impl<T: VectorRepr> GarnetFpStore<T> {
 
         Ok(Self {
             pool,
+            client,
+            timeout,
             next: std::sync::atomic::AtomicUsize::new(0),
             prefix: cfg.key_prefix.clone(),
             breaker: CircuitBreaker::new(
@@ -353,6 +360,16 @@ impl<T: VectorRepr> GarnetFpStore<T> {
             }
             Err(e) => {
                 self.breaker.on_failure();
+                // A failed sync connection must not be reused: after a read timeout the late reply
+                // stays in the socket buffer and desynchronizes the RESP stream (every subsequent
+                // command on this connection would read a stale reply). Best-effort replace it; if
+                // the server is down this fails quickly and the old connection stays (still broken,
+                // but the breaker is open by then and the next half-open probe retries the rebuild).
+                if let Ok(fresh) = self.client.get_connection() {
+                    let _ = fresh.set_read_timeout(Some(self.timeout));
+                    let _ = fresh.set_write_timeout(Some(self.timeout));
+                    *guard = fresh;
+                }
                 Err(e)
             }
         }
