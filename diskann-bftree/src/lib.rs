@@ -15,6 +15,7 @@ pub mod provider;
 pub mod quant;
 pub mod vectors;
 
+mod fp_store;
 mod locks;
 
 pub use id::BfTreeId;
