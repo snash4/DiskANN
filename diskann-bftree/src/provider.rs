@@ -48,7 +48,7 @@ use super::{
     vectors::VectorProvider,
     AccessError, BfTreeId, NoStore,
 };
-use crate::fp_store::{BfTreeFpStore, FpStore};
+use crate::fp_store::{BfTreeFpStore, FpBackendSelection, FpStore, GarnetFpStore};
 use crate::locks::StripedLocks;
 use diskann_providers::model::graph::provider::async_::distances::UnwrapErr;
 use diskann_providers::storage::{LoadWith, SaveWith, StorageReadProvider, StorageWriteProvider};
@@ -104,6 +104,7 @@ use diskann_providers::storage::{LoadWith, SaveWith, StorageReadProvider, Storag
 /// use std::num::NonZeroUsize;
 ///
 /// let parameters = BfTreeProviderParameters {
+///     fp_backend: Default::default(),
 ///     max_points: 5,
 ///     num_start_points: NonZeroUsize::new(1).unwrap(),
 ///     dim: 4,
@@ -159,6 +160,7 @@ use diskann_providers::storage::{LoadWith, SaveWith, StorageReadProvider, Storag
 /// let quantizer: Poly<dyn iface::Quantizer> = poly!(iface::Quantizer, poly);
 ///
 /// let parameters = BfTreeProviderParameters {
+///     fp_backend: Default::default(),
 ///     max_points: 5,
 ///     num_start_points: NonZeroUsize::new(1).unwrap(),
 ///     dim: 4,
@@ -266,6 +268,12 @@ pub struct BfTreeProviderParameters {
 
     // Whether to enable CPR snapshot support on the underlying bf-trees.
     pub use_snapshot: bool,
+
+    // Which backend stores the full-precision vectors. Default: bf-tree (byte-identical to the
+    // pre-fork behavior). `Garnet(...)` stores FP in a standalone Garnet KV over RESP and bf-tree
+    // stores no FP; only meaningful for quantized indices. Save/snapshot with the garnet backend
+    // is not yet supported (Phase 4 adds backend-aware save/load).
+    pub fp_backend: FpBackendSelection,
 }
 
 impl<T, Q, I> BfTreeProvider<T, Q, I>
@@ -313,12 +321,24 @@ where
 
         Ok(Self {
             quant_vectors: quant_precursor.create(params.quant_vector_provider_config)?,
-            full_vectors: FpStore::BfTree(BfTreeFpStore::new(VectorProvider::new_with_config(
-                params.max_points,
-                params.dim,
-                params.num_start_points.get(),
-                params.vector_provider_config,
-            )?)),
+            full_vectors: match params.fp_backend.clone() {
+                FpBackendSelection::BfTree => {
+                    FpStore::BfTree(BfTreeFpStore::new(VectorProvider::new_with_config(
+                        params.max_points,
+                        params.dim,
+                        params.num_start_points.get(),
+                        params.vector_provider_config,
+                    )?))
+                }
+                FpBackendSelection::Garnet(garnet_cfg) => {
+                    FpStore::Garnet(GarnetFpStore::connect(
+                        &garnet_cfg,
+                        params.dim,
+                        params.max_points,
+                        params.num_start_points.get(),
+                    )?)
+                }
+            },
             neighbor_provider: NeighborProvider::new_with_config(
                 params.max_degree,
                 params.neighbor_list_provider_config,
@@ -1809,6 +1829,14 @@ where
     where
         P: StorageWriteProvider,
     {
+        if self.full_vectors.is_garnet() {
+            return Err(ANNError::message(
+                "save/snapshot is not yet supported with the garnet FP backend: the FP store \
+                 lives in Garnet and is repopulated from the WAL on recovery (backend-aware \
+                 save/load lands in Phase 4)"
+                    .to_string(),
+            ));
+        }
         let saved_params = SavedParams {
             max_points: self.max_points(),
             frozen_points: NonZeroUsize::new(self.num_start_points())
@@ -1934,6 +1962,14 @@ where
     where
         P: StorageWriteProvider,
     {
+        if self.full_vectors.is_garnet() {
+            return Err(ANNError::message(
+                "save/snapshot is not yet supported with the garnet FP backend: the FP store \
+                 lives in Garnet and is repopulated from the WAL on recovery (backend-aware \
+                 save/load lands in Phase 4)"
+                    .to_string(),
+            ));
+        }
         let saved_params = SavedParams {
             max_points: self.max_points(),
             frozen_points: NonZeroUsize::new(self.num_start_points())
@@ -2126,6 +2162,7 @@ mod tests {
 
         let provider = BfTreeProvider::new(
             BfTreeProviderParameters {
+                fp_backend: Default::default(),
                 max_points: 20,
                 num_start_points: NonZeroUsize::new(1).unwrap(),
                 dim,
@@ -2206,6 +2243,7 @@ mod tests {
 
         let provider: BfTreeProvider<f32, QuantVectorProvider, u64> = BfTreeProvider::new(
             BfTreeProviderParameters {
+                fp_backend: Default::default(),
                 max_points: 20,
                 num_start_points: NonZeroUsize::new(1).unwrap(),
                 dim,
@@ -2294,6 +2332,7 @@ mod tests {
 
         let provider: BfTreeProvider<f32, QuantVectorProvider, u64> = BfTreeProvider::new(
             BfTreeProviderParameters {
+                fp_backend: Default::default(),
                 max_points: base as usize + num_points as usize + 1,
                 num_start_points: NonZeroUsize::new(1).unwrap(),
                 dim,
@@ -2484,6 +2523,7 @@ mod tests {
 
         let provider = BfTreeProvider::new(
             BfTreeProviderParameters {
+                fp_backend: Default::default(),
                 max_points: 20,
                 num_start_points: NonZeroUsize::new(1).unwrap(),
                 dim: 5,
@@ -2638,6 +2678,7 @@ mod tests {
 
             let provider: BfTreeProvider<f32, NoStore, I> = BfTreeProvider::new(
                 BfTreeProviderParameters {
+                    fp_backend: Default::default(),
                     max_points,
                     num_start_points: NonZeroUsize::new(1).unwrap(),
                     dim: DIM,
@@ -2828,6 +2869,7 @@ mod tests {
 
         let provider = BfTreeProvider::new(
             BfTreeProviderParameters {
+                fp_backend: Default::default(),
                 max_points: 10,
                 num_start_points: NonZeroUsize::new(num_start_points).unwrap(),
                 dim,
@@ -2915,6 +2957,7 @@ mod tests {
 
         let provider = BfTreeProvider::<f32, _>::new(
             BfTreeProviderParameters {
+                fp_backend: Default::default(),
                 max_points: num_points as usize,
                 num_start_points: NonZeroUsize::new(num_start_points).unwrap(),
                 dim,
@@ -3036,6 +3079,7 @@ mod tests {
 
         // Create provider parameters
         let params = BfTreeProviderParameters {
+            fp_backend: Default::default(),
             max_points: num_points,
             num_start_points,
             dim,
@@ -3168,6 +3212,7 @@ mod tests {
 
         // Create provider parameters
         let params = BfTreeProviderParameters {
+            fp_backend: Default::default(),
             max_points: num_points,
             num_start_points,
             dim,
@@ -3303,6 +3348,7 @@ mod tests {
         // In-memory config (no file path needed)
         let provider = BfTreeProvider::<f32, NoStore>::new(
             BfTreeProviderParameters {
+                fp_backend: Default::default(),
                 max_points: num_points,
                 num_start_points,
                 dim,
@@ -3417,6 +3463,7 @@ mod tests {
         let start_points = Matrix::new(Init(|| 0.0f32), num_start_points.into(), dim);
         let provider = BfTreeProvider::<f32, QuantVectorProvider>::new(
             BfTreeProviderParameters {
+                fp_backend: Default::default(),
                 max_points: num_points,
                 num_start_points,
                 dim,
@@ -3593,6 +3640,7 @@ mod tests {
         neighbor_config.use_snapshot(true);
 
         let params = BfTreeProviderParameters {
+            fp_backend: Default::default(),
             max_points: num_points,
             num_start_points,
             dim,
@@ -3671,6 +3719,7 @@ mod tests {
         let start_points = Matrix::new(Init(|| 0.0f32), num_start_points.into(), dim);
 
         let params = BfTreeProviderParameters {
+            fp_backend: Default::default(),
             // Largest index would be u32::MAX + 1, which a u32 id cannot hold.
             max_points: u32::MAX as usize + 2,
             num_start_points,

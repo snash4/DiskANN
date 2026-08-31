@@ -229,7 +229,7 @@ impl CircuitBreaker {
 
 /// Configuration for the Garnet FP backend.
 #[derive(Debug, Clone)]
-pub(crate) struct GarnetConfig {
+pub struct GarnetConfig {
     /// RESP endpoints, e.g. `["redis://127.0.0.1:6379"]` or `["host:port"]`. First endpoint is used;
     /// the list form keeps the surface stable for later multi-endpoint support.
     pub endpoints: Vec<String>,
@@ -241,6 +241,19 @@ pub(crate) struct GarnetConfig {
     pub breaker_threshold: u32,
     /// Key prefix namespacing the FP store (default `"fp:"`).
     pub key_prefix: String,
+}
+
+/// Which backend stores the full-precision vectors — the user-facing selection carried in
+/// `BfTreeProviderParameters`.
+///
+/// `BfTree` (default) is byte-identical to the pre-fork behavior. `Garnet` stores FP in a standalone
+/// Garnet KV over RESP and bf-tree stores **no** FP vectors; only meaningful for quantized indices
+/// (a full-precision index reads FP on every traversal hop, which must stay local).
+#[derive(Debug, Clone, Default)]
+pub enum FpBackendSelection {
+    #[default]
+    BfTree,
+    Garnet(GarnetConfig),
 }
 
 /// Full-precision vectors in a standalone Garnet KV store, over RESP.
@@ -525,6 +538,11 @@ impl<T: VectorRepr> FpStore<T> {
     /// instead of failing the query. bf-tree errors stay hard (today's behavior); the networked
     /// garnet backend degrades (breaker-open / transient network failure must not fail searches).
     pub(super) fn degrade_on_error(&self) -> bool {
+        matches!(self, FpStore::Garnet(_))
+    }
+
+    /// Whether the garnet backend is active (used to gate the not-yet-decoupled save/load path).
+    pub(super) fn is_garnet(&self) -> bool {
         matches!(self, FpStore::Garnet(_))
     }
 
