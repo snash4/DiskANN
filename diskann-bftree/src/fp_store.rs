@@ -23,6 +23,7 @@
 // call the trait.
 #![allow(dead_code)]
 
+use diskann::error::{RankedError, TransientError};
 use diskann::utils::VectorRepr;
 use diskann::ANNResult;
 
@@ -39,6 +40,15 @@ pub(crate) trait FpVectorStore<T: VectorRepr>: Send + Sync {
     /// Fetch one vector by slot. `Err(AccessError::Transient)` means "no live vector here"
     /// (deleted / not yet written); callers treat that as absent, not fatal.
     fn get_vector_sync(&self, i: usize) -> Result<Vec<T>, AccessError>;
+
+    /// Fetch the vectors for `slots` in **one batched call**. `out[i]` corresponds to `slots[i]`:
+    /// `Some(vec)` if present, `None` if the slot has no live vector (deleted / not yet written).
+    /// `out` is cleared and resized to `slots.len()`.
+    ///
+    /// This is the rerank read. A KV backend answers it with a single multi-get round-trip; the
+    /// bf-tree backend loops internally (identical behavior to per-slot reads). Hard errors (not
+    /// per-slot absence) abort the batch.
+    fn get_many(&self, slots: &[usize], out: &mut Vec<Option<Vec<T>>>) -> ANNResult<()>;
 
     /// Fetch one vector into a caller-provided buffer (avoids allocation on the hot read path).
     fn get_vector_into(&self, i: usize, buffer: &mut [T]) -> Result<(), AccessError>;
@@ -90,6 +100,24 @@ impl<T: VectorRepr> BfTreeFpStore<T> {
 impl<T: VectorRepr> FpVectorStore<T> for BfTreeFpStore<T> {
     fn get_vector_sync(&self, i: usize) -> Result<Vec<T>, AccessError> {
         self.inner.get_vector_sync(i)
+    }
+
+    fn get_many(&self, slots: &[usize], out: &mut Vec<Option<Vec<T>>>) -> ANNResult<()> {
+        out.clear();
+        out.reserve(slots.len());
+        for &i in slots {
+            match self.inner.get_vector_sync(i) {
+                Ok(v) => out.push(Some(v)),
+                Err(RankedError::Transient(t)) => {
+                    // Deleted/missing slot: absent, not fatal — same semantics as the previous
+                    // per-candidate `allow_transient("stale candidate during rerank")`.
+                    t.acknowledge("stale candidate during rerank");
+                    out.push(None);
+                }
+                Err(RankedError::Error(e)) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     fn get_vector_into(&self, i: usize, buffer: &mut [T]) -> Result<(), AccessError> {
@@ -172,6 +200,13 @@ impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
         }))
     }
 
+    fn get_many(&self, slots: &[usize], out: &mut Vec<Option<Vec<T>>>) -> ANNResult<()> {
+        // Unwired skeleton: every slot reads as absent. Phase 5 replaces this with one RESP MGET.
+        out.clear();
+        out.resize_with(slots.len(), || None);
+        Ok(())
+    }
+
     fn set_vector_sync(&self, _i: usize, _v: &[T]) -> ANNResult<()> {
         Err(Self::unwired())
     }
@@ -231,6 +266,14 @@ impl<T: VectorRepr> FpStore<T> {
         match self {
             FpStore::BfTree(s) => s.get_vector_into(i, buffer),
             FpStore::Garnet(s) => s.get_vector_into(i, buffer),
+        }
+    }
+
+    /// Batched fetch — the rerank read. One call per query regardless of candidate count.
+    pub(super) fn get_many(&self, slots: &[usize], out: &mut Vec<Option<Vec<T>>>) -> ANNResult<()> {
+        match self {
+            FpStore::BfTree(s) => s.get_many(slots, out),
+            FpStore::Garnet(s) => s.get_many(slots, out),
         }
     }
 

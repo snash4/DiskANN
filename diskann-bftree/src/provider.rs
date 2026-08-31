@@ -1580,25 +1580,26 @@ where
         Itr: Iterator<Item = Neighbor<I>> + Send,
         B: SearchOutputBuffer<I> + Send + ?Sized,
     {
-        use diskann::error::ErrorExt;
         let provider = accessor.provider;
         let f = T::distance(provider.metric, Some(provider.full_vectors.dim()));
 
+        // Collect candidates so the FP fetch is ONE batched call: a KV backend answers it with a
+        // single multi-get round-trip; the bf-tree backend loops internally with semantics identical
+        // to the previous per-candidate `get_vector_sync` + `allow_transient` loop (absent/deleted
+        // slots are skipped, hard errors abort).
+        let cands: Vec<Neighbor<I>> = candidates.collect();
+        let slots: Vec<usize> = cands.iter().map(|n| n.id().as_index()).collect();
+        let mut fetched: Vec<Option<Vec<T>>> = Vec::new();
+        if let Err(e) = provider.full_vectors.get_many(&slots, &mut fetched) {
+            return std::future::ready(Err(e));
+        }
+
         let mut reranked = Vec::new();
-        for n in candidates {
-            match provider
-                .full_vectors
-                .get_vector_sync(n.id().as_index())
-                .allow_transient("stale candidate during rerank")
-            {
-                Ok(Some(vec)) => {
-                    reranked.push(Neighbor::new(*n.id(), f.evaluate_similarity(query, &vec)));
-                }
-                Ok(None) => {
-                    // Transient (deleted/missing) — skip this candidate.
-                }
-                Err(e) => return std::future::ready(Err(e)),
+        for (n, maybe_vec) in cands.iter().zip(fetched.into_iter()) {
+            if let Some(vec) = maybe_vec {
+                reranked.push(Neighbor::new(*n.id(), f.evaluate_similarity(query, &vec)));
             }
+            // None => deleted/missing candidate — skip.
         }
 
         reranked.sort_unstable_by(neighbor::ord::fast_distance);
