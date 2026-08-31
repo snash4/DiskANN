@@ -116,3 +116,209 @@ impl<T: VectorRepr> FpVectorStore<T> for BfTreeFpStore<T> {
         self.inner.starting_points::<I>()
     }
 }
+
+// ================================================================================================
+// GarnetFpStore — the KV backend (skeleton)
+// ================================================================================================
+
+/// Full-precision vectors in a standalone Garnet KV store (RESP protocol).
+///
+/// **Skeleton (Phase 2):** the struct and trait impl are complete so `FpStore::Garnet` type-checks,
+/// but the RESP client is not wired yet — reads report "vector not found" (transient), writes fail
+/// with a clear error. Phase 5 ports the real client (redis crate, MGET/SET/DEL, timeout + circuit
+/// breaker — already written and compiling in bftree-stream's `engine/fp/garnet.rs`) and threads the
+/// endpoint configuration through `BfTreeProviderParameters`. Nothing constructs this arm until then.
+pub(crate) struct GarnetFpStore<T: VectorRepr> {
+    /// Vector dimensionality (metadata answered locally; Garnet stores opaque blobs).
+    dim: usize,
+    /// Capacity bookkeeping mirrored from construction params (Garnet has no notion of capacity).
+    max_vectors: usize,
+    num_start_points: usize,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: VectorRepr> GarnetFpStore<T> {
+    /// Construct the skeleton store. Phase 5 replaces this with a connecting constructor
+    /// (endpoints, timeout, breaker) ported from bftree-stream.
+    pub(crate) fn new(dim: usize, max_vectors: usize, num_start_points: usize) -> Self {
+        Self {
+            dim,
+            max_vectors,
+            num_start_points,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn unwired() -> diskann::ANNError {
+        diskann::ANNError::message(
+            "garnet FP backend not wired yet (Phase 5): no RESP client configured".to_string(),
+        )
+    }
+}
+
+impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
+    fn get_vector_sync(&self, i: usize) -> Result<Vec<T>, AccessError> {
+        // Transient "not found": callers on the read path treat this as an absent/deleted vector.
+        Err(diskann::error::RankedError::Transient(crate::VectorUnavailable {
+            id: i,
+            err: crate::VectorError::NotFound,
+        }))
+    }
+
+    fn get_vector_into(&self, i: usize, _buffer: &mut [T]) -> Result<(), AccessError> {
+        Err(diskann::error::RankedError::Transient(crate::VectorUnavailable {
+            id: i,
+            err: crate::VectorError::NotFound,
+        }))
+    }
+
+    fn set_vector_sync(&self, _i: usize, _v: &[T]) -> ANNResult<()> {
+        Err(Self::unwired())
+    }
+
+    fn delete_vector(&self, _i: usize) {
+        // Nothing to delete in the unwired skeleton.
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn total(&self) -> usize {
+        self.max_vectors + self.num_start_points
+    }
+
+    fn starting_points<I: crate::BfTreeId>(&self) -> ANNResult<Vec<I>> {
+        // Start points are stored alongside the vectors in the bf-tree backend; the garnet backend
+        // will answer them from the same slot convention (max_vectors..total) in Phase 5.
+        Ok(((self.max_vectors)..(self.max_vectors + self.num_start_points))
+            .map(I::from_index)
+            .collect())
+    }
+}
+
+// ================================================================================================
+// FpStore — the provider's FP field: an internally-dispatching enum over the two backends
+// ================================================================================================
+
+/// The provider's full-precision store: bf-tree (default) or Garnet, selected at construction.
+///
+/// This is a concrete enum rather than `Box<dyn FpVectorStore>` deliberately:
+/// - several provider sites read **fields** of the bf-tree `VectorProvider` (`num_start_points`,
+///   `max_vectors`, `num_get_calls`) which a trait object cannot expose;
+/// - the (not-yet-decoupled) save/load path needs the bf-tree-only `config()`/`bftree()` accessors.
+///
+/// The enum forwards the data-plane + metadata methods to the active backend, and exposes the
+/// bf-tree-only accessors as passthroughs that are valid in the `BfTree` arm and unreachable in the
+/// `Garnet` arm — safe because until Phase 4 makes save/load backend-aware, nothing constructs
+/// `Garnet` (Phase 5) and the save/load callers are gated to bftree mode.
+pub(super) enum FpStore<T: VectorRepr> {
+    BfTree(BfTreeFpStore<T>),
+    Garnet(GarnetFpStore<T>),
+}
+
+impl<T: VectorRepr> FpStore<T> {
+    // --- Data plane (dispatch to the active backend) ---------------------------------------------
+
+    pub(super) fn get_vector_sync(&self, i: usize) -> Result<Vec<T>, AccessError> {
+        match self {
+            FpStore::BfTree(s) => s.get_vector_sync(i),
+            FpStore::Garnet(s) => s.get_vector_sync(i),
+        }
+    }
+
+    pub(super) fn get_vector_into(&self, i: usize, buffer: &mut [T]) -> Result<(), AccessError> {
+        match self {
+            FpStore::BfTree(s) => s.get_vector_into(i, buffer),
+            FpStore::Garnet(s) => s.get_vector_into(i, buffer),
+        }
+    }
+
+    pub(super) fn set_vector_sync(&self, i: usize, v: &[T]) -> ANNResult<()> {
+        match self {
+            FpStore::BfTree(s) => s.set_vector_sync(i, v),
+            FpStore::Garnet(s) => s.set_vector_sync(i, v),
+        }
+    }
+
+    pub(super) fn delete_vector(&self, i: usize) {
+        match self {
+            FpStore::BfTree(s) => s.delete_vector(i),
+            FpStore::Garnet(s) => s.delete_vector(i),
+        }
+    }
+
+    // --- Metadata (dispatch) ---------------------------------------------------------------------
+
+    pub(super) fn dim(&self) -> usize {
+        match self {
+            FpStore::BfTree(s) => s.dim(),
+            FpStore::Garnet(s) => s.dim(),
+        }
+    }
+
+    pub(super) fn total(&self) -> usize {
+        match self {
+            FpStore::BfTree(s) => s.total(),
+            FpStore::Garnet(s) => s.total(),
+        }
+    }
+
+    pub(super) fn starting_points<I: crate::BfTreeId>(&self) -> ANNResult<Vec<I>> {
+        match self {
+            FpStore::BfTree(s) => s.starting_points::<I>(),
+            FpStore::Garnet(s) => s.starting_points::<I>(),
+        }
+    }
+
+    /// Capacity excluding start points (mirrors `VectorProvider.max_vectors`).
+    pub(super) fn max_vectors(&self) -> usize {
+        match self {
+            FpStore::BfTree(s) => s.inner().max_vectors,
+            FpStore::Garnet(s) => s.max_vectors,
+        }
+    }
+
+    /// Number of frozen start points (mirrors `VectorProvider.num_start_points`).
+    pub(super) fn num_start_points(&self) -> usize {
+        match self {
+            FpStore::BfTree(s) => s.inner().num_start_points,
+            FpStore::Garnet(s) => s.num_start_points,
+        }
+    }
+
+    /// Stats counter: number of `get_vector` calls (bf-tree instruments this; garnet reports 0
+    /// until Phase 5 adds its own counter).
+    pub(super) fn num_get_calls(&self) -> usize {
+        match self {
+            FpStore::BfTree(s) => s.inner().num_get_calls.get(),
+            FpStore::Garnet(_) => 0,
+        }
+    }
+
+    // --- bf-tree-only accessors (save/load path; valid ONLY in the BfTree arm) -------------------
+    //
+    // These exist so the not-yet-decoupled save/load path keeps compiling unchanged. Phase 4 makes
+    // that path backend-aware, gating these calls to bftree mode; until Phase 5 nothing constructs
+    // the Garnet arm, so the unreachable!() cannot fire in practice.
+
+    /// The bf-tree config of the FP store. **bftree backend only.**
+    pub(super) fn config(&self) -> &bf_tree::Config {
+        match self {
+            FpStore::BfTree(s) => s.inner().config(),
+            FpStore::Garnet(_) => {
+                unreachable!("FP save/load is bf-tree-only until Phase 4; garnet has no bf-tree config")
+            }
+        }
+    }
+
+    /// The underlying bf-tree of the FP store. **bftree backend only.**
+    pub(super) fn bftree(&self) -> &bf_tree::BfTree {
+        match self {
+            FpStore::BfTree(s) => s.inner().bftree(),
+            FpStore::Garnet(_) => {
+                unreachable!("FP save/load is bf-tree-only until Phase 4; garnet has no bf-tree")
+            }
+        }
+    }
+}

@@ -48,6 +48,7 @@ use super::{
     vectors::VectorProvider,
     AccessError, BfTreeId, NoStore,
 };
+use crate::fp_store::{BfTreeFpStore, FpStore};
 use crate::locks::StripedLocks;
 use diskann_providers::model::graph::provider::async_::distances::UnwrapErr;
 use diskann_providers::storage::{LoadWith, SaveWith, StorageReadProvider, StorageWriteProvider};
@@ -189,7 +190,7 @@ where
 
     // The full vector store.
     //
-    pub(super) full_vectors: VectorProvider<T>,
+    pub(super) full_vectors: FpStore<T>,
 
     // Provider that holds the graph structure as neighbors of vectors.
     //
@@ -312,12 +313,12 @@ where
 
         Ok(Self {
             quant_vectors: quant_precursor.create(params.quant_vector_provider_config)?,
-            full_vectors: VectorProvider::new_with_config(
+            full_vectors: FpStore::BfTree(BfTreeFpStore::new(VectorProvider::new_with_config(
                 params.max_points,
                 params.dim,
                 params.num_start_points.get(),
                 params.vector_provider_config,
-            )?,
+            )?)),
             neighbor_provider: NeighborProvider::new_with_config(
                 params.max_degree,
                 params.neighbor_list_provider_config,
@@ -392,12 +393,12 @@ where
     }
 
     pub fn num_start_points(&self) -> usize {
-        self.full_vectors.num_start_points
+        self.full_vectors.num_start_points()
     }
 
     /// Return the maximum number of points (excluding frozen/start points)
     pub fn max_points(&self) -> usize {
-        self.full_vectors.max_vectors
+        self.full_vectors.max_vectors()
     }
 
     /// Return the vector dimension
@@ -425,7 +426,7 @@ where
     ///
     pub fn counts_for_get_vector(&self) -> (usize, usize) {
         (
-            self.full_vectors.num_get_calls.get(),
+            self.full_vectors.num_get_calls(),
             self.quant_vectors.num_get_calls.get(),
         )
     }
@@ -439,7 +440,7 @@ where
     /// Return the number of vector reads for full-precision and quant-vectors respectively
     ///
     pub fn counts_for_get_vector(&self) -> (usize, usize) {
-        (self.full_vectors.num_get_calls.get(), 0)
+        (self.full_vectors.num_get_calls(), 0)
     }
 }
 
@@ -1886,12 +1887,14 @@ where
             BfTreePaths::vectors_bftree(&saved_params.prefix),
             saved_params.use_snapshot,
         )?;
-        let full_vectors = VectorProvider::<T>::new_from_bftree(
-            saved_params.max_points,
-            saved_params.dim,
-            saved_params.frozen_points.get(),
-            vector_index,
-        );
+        let full_vectors = FpStore::BfTree(BfTreeFpStore::new(
+            VectorProvider::<T>::new_from_bftree(
+                saved_params.max_points,
+                saved_params.dim,
+                saved_params.frozen_points.get(),
+                vector_index,
+            ),
+        ));
 
         let adjacency_list_index = load_bftree(
             BfTreePaths::neighbors_bftree(&saved_params.prefix),
@@ -2038,12 +2041,14 @@ where
             BfTreePaths::vectors_bftree(&saved_params.prefix),
             saved_params.use_snapshot,
         )?;
-        let full_vectors = VectorProvider::<T>::new_from_bftree(
-            saved_params.max_points,
-            saved_params.dim,
-            saved_params.frozen_points.get(),
-            vector_index,
-        );
+        let full_vectors = FpStore::BfTree(BfTreeFpStore::new(
+            VectorProvider::<T>::new_from_bftree(
+                saved_params.max_points,
+                saved_params.dim,
+                saved_params.frozen_points.get(),
+                vector_index,
+            ),
+        ));
 
         let adjacency_list_index = load_bftree(
             BfTreePaths::neighbors_bftree(&saved_params.prefix),
