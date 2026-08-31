@@ -1591,6 +1591,12 @@ where
         let slots: Vec<usize> = cands.iter().map(|n| n.id().as_index()).collect();
         let mut fetched: Vec<Option<Vec<T>>> = Vec::new();
         if let Err(e) = provider.full_vectors.get_many(&slots, &mut fetched) {
+            if provider.full_vectors.degrade_on_error() {
+                // Networked FP backend unavailable (breaker open / transient failure): degrade to
+                // quantized-only ordering — pass the candidates through in their incoming order
+                // rather than failing the search. Lower recall, still valid results.
+                return std::future::ready(Ok(output.extend(cands)));
+            }
             return std::future::ready(Err(e));
         }
 

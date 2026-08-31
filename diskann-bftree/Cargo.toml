@@ -11,6 +11,8 @@ edition.workspace = true
 
 [dependencies]
 bf-tree.workspace = true
+# RESP client for the Garnet FP backend (FpStore::Garnet).
+redis.workspace = true
 bytemuck = { workspace = true, features = ["must_cast"] }
 diskann.workspace = true
 diskann-providers.workspace = true

@@ -146,73 +146,318 @@ impl<T: VectorRepr> FpVectorStore<T> for BfTreeFpStore<T> {
 }
 
 // ================================================================================================
-// GarnetFpStore — the KV backend (skeleton)
+// Circuit breaker (std-only; ported from bftree-stream engine/fp/breaker.rs)
 // ================================================================================================
 
-/// Full-precision vectors in a standalone Garnet KV store (RESP protocol).
+/// Consecutive-failure circuit breaker with time-based half-open recovery.
 ///
-/// **Skeleton (Phase 2):** the struct and trait impl are complete so `FpStore::Garnet` type-checks,
-/// but the RESP client is not wired yet — reads report "vector not found" (transient), writes fail
-/// with a clear error. Phase 5 ports the real client (redis crate, MGET/SET/DEL, timeout + circuit
-/// breaker — already written and compiling in bftree-stream's `engine/fp/garnet.rs`) and threads the
-/// endpoint configuration through `BfTreeProviderParameters`. Nothing constructs this arm until then.
+/// FP rerank is on the query critical path and, in garnet mode, there is no bf-tree FP fallback —
+/// so a slow/unreachable Garnet must not stall queries. Once failures pile up the breaker opens and
+/// callers degrade (quantized-only rerank) until a cooldown elapses; then a probe call half-opens it.
+pub(crate) struct CircuitBreaker {
+    consecutive_failures: std::sync::atomic::AtomicU32,
+    threshold: u32,
+    cooldown: std::time::Duration,
+    /// Nanos-since-epoch at which the breaker opened; 0 = closed.
+    opened_at_nanos: std::sync::atomic::AtomicU64,
+    epoch: std::time::Instant,
+    trip_count: std::sync::atomic::AtomicU64,
+}
+
+impl CircuitBreaker {
+    pub(crate) fn new(threshold: u32, cooldown: std::time::Duration) -> Self {
+        Self {
+            consecutive_failures: std::sync::atomic::AtomicU32::new(0),
+            threshold: threshold.max(1),
+            cooldown,
+            opened_at_nanos: std::sync::atomic::AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
+            trip_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn now_nanos(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
+
+    /// Whether a call should be attempted now (closed or half-open).
+    pub(crate) fn allows_call(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let opened = self.opened_at_nanos.load(Ordering::Acquire);
+        if opened == 0 {
+            return true;
+        }
+        // Open; allow the probe once the cooldown elapsed (half-open).
+        self.now_nanos().saturating_sub(opened) >= self.cooldown.as_nanos() as u64
+    }
+
+    pub(crate) fn on_success(&self) {
+        use std::sync::atomic::Ordering;
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.opened_at_nanos.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn on_failure(&self) {
+        use std::sync::atomic::Ordering;
+        let opened = self.opened_at_nanos.load(Ordering::Acquire);
+        if opened != 0 {
+            // Failed while open/half-open (a probe failure): restart the cooldown.
+            self.opened_at_nanos.store(self.now_nanos().max(1), Ordering::Release);
+            self.trip_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if failures >= self.threshold {
+            let _ = self.opened_at_nanos.compare_exchange(
+                0,
+                self.now_nanos().max(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.trip_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn trip_count(&self) -> u64 {
+        self.trip_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+// ================================================================================================
+// GarnetFpStore — the KV backend (real implementation, sync RESP client)
+// ================================================================================================
+
+/// Configuration for the Garnet FP backend.
+#[derive(Debug, Clone)]
+pub(crate) struct GarnetConfig {
+    /// RESP endpoints, e.g. `["redis://127.0.0.1:6379"]` or `["host:port"]`. First endpoint is used;
+    /// the list form keeps the surface stable for later multi-endpoint support.
+    pub endpoints: Vec<String>,
+    /// Per-call read/write timeout in milliseconds.
+    pub timeout_ms: u64,
+    /// Number of pooled connections (concurrent reranks round-robin over them).
+    pub pool_size: usize,
+    /// Consecutive failures before the breaker opens.
+    pub breaker_threshold: u32,
+    /// Key prefix namespacing the FP store (default `"fp:"`).
+    pub key_prefix: String,
+}
+
+/// Full-precision vectors in a standalone Garnet KV store, over RESP.
+///
+/// Uses the **synchronous** redis client deliberately: the provider's read/write paths are sync (the
+/// same threads already do blocking bf-tree disk I/O), and a sync client avoids threading a tokio
+/// runtime handle through `BfTreeProviderParameters`. A small round-robin pool of connections serves
+/// concurrent reranks; each call is bounded by the configured read/write timeout and guarded by the
+/// circuit breaker.
+///
+/// Wire format: key = `"{prefix}{slot}"`, value = the vector's raw `T` bytes
+/// (`bytemuck` cast — `VectorRepr: VectorElement: bytemuck::Pod` guarantees castability).
 pub(crate) struct GarnetFpStore<T: VectorRepr> {
-    /// Vector dimensionality (metadata answered locally; Garnet stores opaque blobs).
+    pool: Vec<std::sync::Mutex<redis::Connection>>,
+    next: std::sync::atomic::AtomicUsize,
+    prefix: String,
+    breaker: CircuitBreaker,
     dim: usize,
-    /// Capacity bookkeeping mirrored from construction params (Garnet has no notion of capacity).
     max_vectors: usize,
     num_start_points: usize,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: VectorRepr> GarnetFpStore<T> {
-    /// Construct the skeleton store. Phase 5 replaces this with a connecting constructor
-    /// (endpoints, timeout, breaker) ported from bftree-stream.
-    pub(crate) fn new(dim: usize, max_vectors: usize, num_start_points: usize) -> Self {
-        Self {
+    /// Connect to Garnet and build the connection pool.
+    pub(crate) fn connect(
+        cfg: &GarnetConfig,
+        dim: usize,
+        max_vectors: usize,
+        num_start_points: usize,
+    ) -> ANNResult<Self> {
+        let endpoint = cfg.endpoints.first().ok_or_else(|| {
+            diskann::ANNError::message("garnet fp backend: endpoints is empty".to_string())
+        })?;
+        let url = if endpoint.starts_with("redis://") || endpoint.starts_with("rediss://") {
+            endpoint.clone()
+        } else {
+            format!("redis://{endpoint}")
+        };
+        let client = redis::Client::open(url.as_str()).map_err(|e| {
+            diskann::ANNError::message(format!("garnet fp backend: bad endpoint {endpoint}: {e}"))
+        })?;
+
+        let timeout = std::time::Duration::from_millis(cfg.timeout_ms.max(1));
+        let pool_size = cfg.pool_size.max(1);
+        let mut pool = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let conn = client.get_connection().map_err(|e| {
+                diskann::ANNError::message(format!(
+                    "garnet fp backend: connect to {endpoint} failed: {e}"
+                ))
+            })?;
+            conn.set_read_timeout(Some(timeout)).map_err(|e| {
+                diskann::ANNError::message(format!("garnet fp backend: set_read_timeout: {e}"))
+            })?;
+            conn.set_write_timeout(Some(timeout)).map_err(|e| {
+                diskann::ANNError::message(format!("garnet fp backend: set_write_timeout: {e}"))
+            })?;
+            pool.push(std::sync::Mutex::new(conn));
+        }
+
+        Ok(Self {
+            pool,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            prefix: cfg.key_prefix.clone(),
+            breaker: CircuitBreaker::new(
+                cfg.breaker_threshold.max(1),
+                // Recovery cooldown: a small multiple of the call timeout, floored to 500ms.
+                std::time::Duration::from_millis((cfg.timeout_ms.max(1) * 20).max(500)),
+            ),
             dim,
             max_vectors,
             num_start_points,
             _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn key(&self, slot: usize) -> String {
+        format!("{}{}", self.prefix, slot)
+    }
+
+    /// Run one redis operation on a pooled connection, recording the outcome in the breaker.
+    fn run<R>(
+        &self,
+        op: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<R>,
+    ) -> Result<R, redis::RedisError> {
+        use std::sync::atomic::Ordering;
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        let mut guard = match self.pool[idx].lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match op(&mut guard) {
+            Ok(v) => {
+                self.breaker.on_success();
+                Ok(v)
+            }
+            Err(e) => {
+                self.breaker.on_failure();
+                Err(e)
+            }
         }
     }
 
-    fn unwired() -> diskann::ANNError {
-        diskann::ANNError::message(
-            "garnet FP backend not wired yet (Phase 5): no RESP client configured".to_string(),
-        )
+    /// Whether the store is currently serving (breaker closed/half-open). When `false`, the rerank
+    /// degrades to quantized-only ordering instead of waiting on Garnet.
+    pub(crate) fn is_available(&self) -> bool {
+        self.breaker.allows_call()
+    }
+
+    /// Breaker trip count (observability).
+    pub(crate) fn breaker_trips(&self) -> u64 {
+        self.breaker.trip_count()
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Option<Vec<T>> {
+        if bytes.len() != self.dim * std::mem::size_of::<T>() {
+            return None; // corrupt/short value: treat the slot as absent rather than panic
+        }
+        // Copy into a T-allocated buffer via its u8 view: alignment-safe regardless of the redis
+        // buffer's alignment (casting T->u8 is always valid; u8->T is not).
+        let mut v = vec![T::default(); self.dim];
+        bytemuck::cast_slice_mut::<T, u8>(&mut v).copy_from_slice(bytes);
+        Some(v)
     }
 }
 
 impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
     fn get_vector_sync(&self, i: usize) -> Result<Vec<T>, AccessError> {
-        // Transient "not found": callers on the read path treat this as an absent/deleted vector.
-        Err(diskann::error::RankedError::Transient(crate::VectorUnavailable {
-            id: i,
-            err: crate::VectorError::NotFound,
-        }))
+        if !self.breaker.allows_call() {
+            return Err(RankedError::Transient(crate::VectorUnavailable {
+                id: i,
+                err: crate::VectorError::NotFound,
+            }));
+        }
+        let key = self.key(i);
+        match self.run(|conn| redis::cmd("GET").arg(&key).query::<Option<Vec<u8>>>(conn)) {
+            Ok(Some(bytes)) => match self.decode(&bytes) {
+                Some(v) => Ok(v),
+                None => Err(RankedError::Transient(crate::VectorUnavailable {
+                    id: i,
+                    err: crate::VectorError::NotFound,
+                })),
+            },
+            Ok(None) => Err(RankedError::Transient(crate::VectorUnavailable {
+                id: i,
+                err: crate::VectorError::NotFound,
+            })),
+            Err(e) => Err(RankedError::Error(diskann::ANNError::message(format!(
+                "garnet fp get({i}): {e}"
+            )))),
+        }
     }
 
-    fn get_vector_into(&self, i: usize, _buffer: &mut [T]) -> Result<(), AccessError> {
-        Err(diskann::error::RankedError::Transient(crate::VectorUnavailable {
-            id: i,
-            err: crate::VectorError::NotFound,
-        }))
-    }
-
-    fn get_many(&self, slots: &[usize], out: &mut Vec<Option<Vec<T>>>) -> ANNResult<()> {
-        // Unwired skeleton: every slot reads as absent. Phase 5 replaces this with one RESP MGET.
-        out.clear();
-        out.resize_with(slots.len(), || None);
+    fn get_vector_into(&self, i: usize, buffer: &mut [T]) -> Result<(), AccessError> {
+        let v = self.get_vector_sync(i)?;
+        if v.len() != buffer.len() {
+            return Err(RankedError::Error(diskann::ANNError::message(format!(
+                "garnet fp get_into({i}): dim mismatch {} vs {}",
+                v.len(),
+                buffer.len()
+            ))));
+        }
+        buffer.copy_from_slice(&v);
         Ok(())
     }
 
-    fn set_vector_sync(&self, _i: usize, _v: &[T]) -> ANNResult<()> {
-        Err(Self::unwired())
+    fn get_many(&self, slots: &[usize], out: &mut Vec<Option<Vec<T>>>) -> ANNResult<()> {
+        out.clear();
+        if slots.is_empty() {
+            return Ok(());
+        }
+        if !self.breaker.allows_call() {
+            // Signal degradation to the caller (Rerank passes candidates through unranked).
+            return Err(diskann::ANNError::message(
+                "garnet fp backend unavailable (breaker open)".to_string(),
+            ));
+        }
+        let keys: Vec<String> = slots.iter().map(|&s| self.key(s)).collect();
+        let values: Vec<Option<Vec<u8>>> = self
+            .run(|conn| {
+                let mut cmd = redis::cmd("MGET");
+                for k in &keys {
+                    cmd.arg(k);
+                }
+                cmd.query::<Vec<Option<Vec<u8>>>>(conn)
+            })
+            .map_err(|e| diskann::ANNError::message(format!("garnet fp mget: {e}")))?;
+        out.reserve(slots.len());
+        for val in values {
+            out.push(val.and_then(|bytes| self.decode(&bytes)));
+        }
+        // MGET must return one entry per key; pad defensively if the server returned fewer.
+        while out.len() < slots.len() {
+            out.push(None);
+        }
+        Ok(())
     }
 
-    fn delete_vector(&self, _i: usize) {
-        // Nothing to delete in the unwired skeleton.
+    fn set_vector_sync(&self, i: usize, v: &[T]) -> ANNResult<()> {
+        // FP-write-precedes-visibility: a failed FP write must fail the insert loudly.
+        let key = self.key(i);
+        let bytes: &[u8] = bytemuck::cast_slice(v);
+        self.run(|conn| {
+            redis::cmd("SET")
+                .arg(&key)
+                .arg(bytes)
+                .query::<()>(conn)
+        })
+        .map_err(|e| diskann::ANNError::message(format!("garnet fp set({i}): {e}")))
+    }
+
+    fn delete_vector(&self, i: usize) {
+        // bf-tree's delete_vector returns (); mirror that. Failures are recorded in the breaker;
+        // a missed DEL leaves an orphaned value that recovery/repopulation overwrites.
+        let key = self.key(i);
+        let _ = self.run(|conn| redis::cmd("DEL").arg(&key).query::<usize>(conn));
     }
 
     fn dim(&self) -> usize {
@@ -224,8 +469,7 @@ impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
     }
 
     fn starting_points<I: crate::BfTreeId>(&self) -> ANNResult<Vec<I>> {
-        // Start points are stored alongside the vectors in the bf-tree backend; the garnet backend
-        // will answer them from the same slot convention (max_vectors..total) in Phase 5.
+        // Start points live at the fixed slot convention (max_vectors..total), same as bf-tree.
         Ok(((self.max_vectors)..(self.max_vectors + self.num_start_points))
             .map(I::from_index)
             .collect())
@@ -275,6 +519,13 @@ impl<T: VectorRepr> FpStore<T> {
             FpStore::BfTree(s) => s.get_many(slots, out),
             FpStore::Garnet(s) => s.get_many(slots, out),
         }
+    }
+
+    /// Whether a rerank that fails against this backend may **degrade** to quantized-only ordering
+    /// instead of failing the query. bf-tree errors stay hard (today's behavior); the networked
+    /// garnet backend degrades (breaker-open / transient network failure must not fail searches).
+    pub(super) fn degrade_on_error(&self) -> bool {
+        matches!(self, FpStore::Garnet(_))
     }
 
     pub(super) fn set_vector_sync(&self, i: usize, v: &[T]) -> ANNResult<()> {
