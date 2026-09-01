@@ -1870,6 +1870,7 @@ where
             is_memory: self.full_vectors.config().is_memory_backend(),
             use_snapshot: self.use_snapshot,
             id_width: std::mem::size_of::<I>(),
+            fp_backend: "bftree".to_string(),
         };
 
         debug_assert_eq!(
