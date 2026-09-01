@@ -1667,9 +1667,19 @@ pub struct SavedParams {
     /// field existed, all of which used `u32` ids.
     #[serde(default = "default_id_width")]
     pub id_width: usize,
+    /// Which backend held the full-precision vectors when this snapshot was written. `"bftree"`
+    /// (the serde default, so pre-existing snapshots parse unchanged) means `vectors.bftree` is part
+    /// of the snapshot; `"garnet"` means FP lives in an external Garnet KV and the snapshot contains
+    /// no FP store — load must go through `load_with_backend` with the garnet endpoints.
+    #[serde(default = "default_fp_backend")]
+    pub fp_backend: String,
 }
 
 /// Default [`SavedParams::id_width`] for legacy indexes (all of which were `u32`).
+fn default_fp_backend() -> String {
+    "bftree".to_string()
+}
+
 fn default_id_width() -> usize {
     std::mem::size_of::<u32>()
 }
@@ -1962,14 +1972,25 @@ where
     where
         P: StorageWriteProvider,
     {
-        if self.full_vectors.is_garnet() {
-            return Err(ANNError::message(
-                "save/snapshot is not yet supported with the garnet FP backend: the FP store \
-                 lives in Garnet and is repopulated from the WAL on recovery (backend-aware \
-                 save/load lands in Phase 4)"
-                    .to_string(),
-            ));
-        }
+        // In garnet mode the FP store lives in an external Garnet KV: the snapshot contains the
+        // neighbor + quant bf-trees and metadata, but NO FP bf-tree (Garnet's data survives
+        // restarts on its own; recovery reconnects and replays the WAL tail). The FP params slot in
+        // the JSON is filled from the quant config purely to keep the shape-stable format populated
+        // — it is never read on a garnet-mode load.
+        let is_garnet = self.full_vectors.is_garnet();
+        let fp_params = if is_garnet {
+            BfTreeParams {
+                bytes: self.quant_vectors.config().get_cb_size_byte(),
+                max_record_size: self.quant_vectors.config().get_cb_max_record_size(),
+                leaf_page_size: self.quant_vectors.config().get_leaf_page_size(),
+            }
+        } else {
+            BfTreeParams {
+                bytes: self.full_vectors.config().get_cb_size_byte(),
+                max_record_size: self.full_vectors.config().get_cb_max_record_size(),
+                leaf_page_size: self.full_vectors.config().get_leaf_page_size(),
+            }
+        };
         let saved_params = SavedParams {
             max_points: self.max_points(),
             frozen_points: NonZeroUsize::new(self.num_start_points())
@@ -1978,11 +1999,7 @@ where
             metric: self.metric().as_str().to_string(),
             max_degree: self.max_degree(),
             prefix: prefix.clone(),
-            params_vector: BfTreeParams {
-                bytes: self.full_vectors.config().get_cb_size_byte(),
-                max_record_size: self.full_vectors.config().get_cb_max_record_size(),
-                leaf_page_size: self.full_vectors.config().get_leaf_page_size(),
-            },
+            params_vector: fp_params,
             params_neighbor: BfTreeParams {
                 bytes: self.neighbor_provider.config().get_cb_size_byte(),
                 max_record_size: self.neighbor_provider.config().get_cb_max_record_size(),
@@ -1996,21 +2013,28 @@ where
                 },
             }),
             graph_params: self.graph_params.clone(),
-            is_memory: self.full_vectors.config().is_memory_backend(),
+            is_memory: if is_garnet {
+                self.neighbor_provider.config().is_memory_backend()
+            } else {
+                self.full_vectors.config().is_memory_backend()
+            },
             use_snapshot: self.use_snapshot,
             id_width: std::mem::size_of::<I>(),
+            fp_backend: if is_garnet { "garnet" } else { "bftree" }.to_string(),
         };
 
         debug_assert_eq!(
-            self.full_vectors.config().is_memory_backend(),
             self.neighbor_provider.config().is_memory_backend(),
-            "Vector and neighbor stores have mismatched storage backends"
-        );
-        debug_assert_eq!(
-            self.full_vectors.config().is_memory_backend(),
             self.quant_vectors.config().is_memory_backend(),
-            "Vector and quant stores have mismatched storage backends"
+            "Neighbor and quant stores have mismatched storage backends"
         );
+        if !is_garnet {
+            debug_assert_eq!(
+                self.full_vectors.config().is_memory_backend(),
+                self.neighbor_provider.config().is_memory_backend(),
+                "Vector and neighbor stores have mismatched storage backends"
+            );
+        }
 
         {
             let params_filename = BfTreePaths::params_json(&saved_params.prefix);
@@ -2021,11 +2045,13 @@ where
             params_writer.write_all(params_json.as_bytes())?;
         }
 
-        save_bftree(
-            self.full_vectors.bftree(),
-            BfTreePaths::vectors_bftree(&saved_params.prefix),
-            self.use_snapshot,
-        )?;
+        if !is_garnet {
+            save_bftree(
+                self.full_vectors.bftree(),
+                BfTreePaths::vectors_bftree(&saved_params.prefix),
+                self.use_snapshot,
+            )?;
+        }
         save_bftree(
             self.neighbor_provider.bftree(),
             BfTreePaths::neighbors_bftree(&saved_params.prefix),
@@ -2050,14 +2076,28 @@ where
     }
 }
 
-impl<T, I> LoadWith<String> for BfTreeProvider<T, QuantVectorProvider, I>
+impl<T, I> BfTreeProvider<T, QuantVectorProvider, I>
 where
     T: VectorRepr,
     I: BfTreeId,
 {
-    type Error = ANNError;
-
-    async fn load_with<P>(storage: &P, prefix: &String) -> Result<Self, Self::Error>
+    /// Load a quantized provider with an explicit FP-backend selection.
+    ///
+    /// This is the load entry point that supports both FP backends. Endpoints are deployment
+    /// configuration, not snapshot state, so the caller supplies the selection (typically mapped
+    /// from its own config): `BfTree` loads `vectors.bftree` from the snapshot exactly as before;
+    /// `Garnet(cfg)` skips it and reconnects to the Garnet server (whose data survived the restart;
+    /// the caller's WAL-tail replay re-writes any FP newer than the snapshot, idempotently).
+    ///
+    /// The snapshot records which backend wrote it; a mismatch with the requested selection is a
+    /// hard error, because loading a garnet-written snapshot in bftree mode has no FP bf-tree to
+    /// read, and loading a bftree-written snapshot in garnet mode would rerank against a Garnet
+    /// store that never received those vectors — a silent recall collapse.
+    pub async fn load_with_backend<P>(
+        storage: &P,
+        prefix: &String,
+        fp_backend: FpBackendSelection,
+    ) -> Result<Self, ANNError>
     where
         P: StorageReadProvider,
     {
@@ -2073,25 +2113,46 @@ where
 
         validate_loaded_id_params::<I>(&saved_params)?;
 
-        let _quant_params = saved_params.quant_params.ok_or_else(|| {
+        let _quant_params = saved_params.quant_params.as_ref().ok_or_else(|| {
             ANNError::message("Missing quant_params in saved params for quantized provider")
         })?;
+
+        // Snapshot backend vs requested backend must agree (see doc comment).
+        let requested_garnet = matches!(fp_backend, FpBackendSelection::Garnet(_));
+        let saved_garnet = saved_params.fp_backend == "garnet";
+        if requested_garnet != saved_garnet {
+            return Err(ANNError::message(lazy_format!(
+                move,
+                "FP backend mismatch: snapshot was written with fp_backend={} but load requested {} \
+                 — reload with the matching fp_backend (or rebuild the index under the new backend)",
+                saved_params.fp_backend,
+                if requested_garnet { "garnet" } else { "bftree" }
+            )));
+        }
 
         let metric = Metric::from_str(&saved_params.metric)
             .map_err(|e| ANNError::message(lazy_format!(move, "Failed to parse metric: {}", e)))?;
 
-        let vector_index = load_bftree(
-            BfTreePaths::vectors_bftree(&saved_params.prefix),
-            saved_params.use_snapshot,
-        )?;
-        let full_vectors = FpStore::BfTree(BfTreeFpStore::new(
-            VectorProvider::<T>::new_from_bftree(
-                saved_params.max_points,
+        let full_vectors = match fp_backend {
+            FpBackendSelection::BfTree => {
+                let vector_index = load_bftree(
+                    BfTreePaths::vectors_bftree(&saved_params.prefix),
+                    saved_params.use_snapshot,
+                )?;
+                FpStore::BfTree(BfTreeFpStore::new(VectorProvider::<T>::new_from_bftree(
+                    saved_params.max_points,
+                    saved_params.dim,
+                    saved_params.frozen_points.get(),
+                    vector_index,
+                )))
+            }
+            FpBackendSelection::Garnet(garnet_cfg) => FpStore::Garnet(GarnetFpStore::connect(
+                &garnet_cfg,
                 saved_params.dim,
+                saved_params.max_points,
                 saved_params.frozen_points.get(),
-                vector_index,
-            ),
-        ));
+            )?),
+        };
 
         let adjacency_list_index = load_bftree(
             BfTreePaths::neighbors_bftree(&saved_params.prefix),
@@ -2122,6 +2183,24 @@ where
             use_snapshot: saved_params.use_snapshot,
             locks: StripedLocks::new(),
         })
+    }
+}
+
+impl<T, I> LoadWith<String> for BfTreeProvider<T, QuantVectorProvider, I>
+where
+    T: VectorRepr,
+    I: BfTreeId,
+{
+    type Error = ANNError;
+
+    async fn load_with<P>(storage: &P, prefix: &String) -> Result<Self, Self::Error>
+    where
+        P: StorageReadProvider,
+    {
+        // The no-argument trait path is the bftree-mode load (endpoints can't travel through it).
+        // A garnet-written snapshot fails here with the mismatch error directing callers to
+        // `load_with_backend`.
+        Self::load_with_backend(storage, prefix, FpBackendSelection::BfTree).await
     }
 }
 
