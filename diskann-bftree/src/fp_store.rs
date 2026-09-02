@@ -342,10 +342,33 @@ impl<T: VectorRepr> GarnetFpStore<T> {
         format!("{}{}", self.prefix, slot)
     }
 
+    /// Replace a (possibly desynchronized) pooled connection with a fresh one, best-effort.
+    ///
+    /// After a read timeout the late reply stays in the socket buffer and desynchronizes the RESP
+    /// stream — every subsequent command on that connection would read a stale reply — so a failed
+    /// connection must never be reused. If the server is down the rebuild fails quickly and the old
+    /// connection stays (still broken, but the breaker opens and its half-open probe retries).
+    fn refresh(&self, guard: &mut redis::Connection) -> bool {
+        match self.client.get_connection() {
+            Ok(fresh) => {
+                let _ = fresh.set_read_timeout(Some(self.timeout));
+                let _ = fresh.set_write_timeout(Some(self.timeout));
+                *guard = fresh;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Run one redis operation on a pooled connection, recording the outcome in the breaker.
+    ///
+    /// On failure the connection is replaced and the operation retried **once** on the fresh
+    /// connection: every operation here is idempotent (SET/GET/MGET/DEL), so a retry is safe, and it
+    /// absorbs an isolated timeout (EAGAIN under load) as latency instead of a failed insert/search.
+    /// A second consecutive failure is returned (and counted by the breaker).
     fn run<R>(
         &self,
-        op: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<R>,
+        op: impl Fn(&mut redis::Connection) -> redis::RedisResult<R>,
     ) -> Result<R, redis::RedisError> {
         use std::sync::atomic::Ordering;
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
@@ -356,20 +379,25 @@ impl<T: VectorRepr> GarnetFpStore<T> {
         match op(&mut guard) {
             Ok(v) => {
                 self.breaker.on_success();
+                return Ok(v);
+            }
+            Err(e) => {
+                self.breaker.on_failure();
+                // Rebuild the connection; if that fails (server down), don't retry — fail fast.
+                if !self.refresh(&mut guard) {
+                    return Err(e);
+                }
+            }
+        }
+        // One retry on the fresh connection.
+        match op(&mut guard) {
+            Ok(v) => {
+                self.breaker.on_success();
                 Ok(v)
             }
             Err(e) => {
                 self.breaker.on_failure();
-                // A failed sync connection must not be reused: after a read timeout the late reply
-                // stays in the socket buffer and desynchronizes the RESP stream (every subsequent
-                // command on this connection would read a stale reply). Best-effort replace it; if
-                // the server is down this fails quickly and the old connection stays (still broken,
-                // but the breaker is open by then and the next half-open probe retries the rebuild).
-                if let Ok(fresh) = self.client.get_connection() {
-                    let _ = fresh.set_read_timeout(Some(self.timeout));
-                    let _ = fresh.set_write_timeout(Some(self.timeout));
-                    *guard = fresh;
-                }
+                let _ = self.refresh(&mut guard);
                 Err(e)
             }
         }
