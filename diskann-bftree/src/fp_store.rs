@@ -241,6 +241,13 @@ pub struct GarnetConfig {
     pub breaker_threshold: u32,
     /// Key prefix namespacing the FP store (default `"fp:"`).
     pub key_prefix: String,
+    /// Whether the endpoints form a Redis-protocol **cluster** (slot-sharded, MOVED redirections).
+    /// `false` (default): a single standalone server — first endpoint used. `true`: the endpoints
+    /// are **seeds** for topology discovery — ONE is sufficient (the client asks it for the full
+    /// node/slot map and finds the rest itself); listing more only hardens bootstrap (startup
+    /// survives any listed seed being down). The cluster client follows redirections, tracks
+    /// topology changes, and splits multi-key MGETs per owning node.
+    pub cluster: bool,
 }
 
 /// Which backend stores the full-precision vectors — the user-facing selection carried in
@@ -266,12 +273,85 @@ pub enum FpBackendSelection {
 ///
 /// Wire format: key = `"{prefix}{slot}"`, value = the vector's raw `T` bytes
 /// (`bytemuck` cast — `VectorRepr: VectorElement: bytemuck::Pod` guarantees castability).
+/// A pooled connection to either a standalone server or a cluster.
+///
+/// Both variants implement `ConnectionLike`, so every command site (`redis::cmd(...).query(conn)`)
+/// is mode-agnostic. The cluster variant follows MOVED/ASK redirections and splits multi-key
+/// commands (our rerank MGET) per owning node, reassembling replies in key order.
+pub(crate) enum GarnetConn {
+    Single(redis::Connection),
+    Cluster(redis::cluster::ClusterConnection),
+}
+
+impl redis::ConnectionLike for GarnetConn {
+    fn req_packed_command(&mut self, cmd: &[u8]) -> redis::RedisResult<redis::Value> {
+        match self {
+            GarnetConn::Single(c) => c.req_packed_command(cmd),
+            GarnetConn::Cluster(c) => c.req_packed_command(cmd),
+        }
+    }
+    fn req_packed_commands(
+        &mut self,
+        cmd: &[u8],
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisResult<Vec<redis::Value>> {
+        match self {
+            GarnetConn::Single(c) => c.req_packed_commands(cmd, offset, count),
+            GarnetConn::Cluster(c) => c.req_packed_commands(cmd, offset, count),
+        }
+    }
+    fn get_db(&self) -> i64 {
+        match self {
+            GarnetConn::Single(c) => c.get_db(),
+            GarnetConn::Cluster(c) => c.get_db(),
+        }
+    }
+    fn check_connection(&mut self) -> bool {
+        match self {
+            GarnetConn::Single(c) => c.check_connection(),
+            GarnetConn::Cluster(c) => c.check_connection(),
+        }
+    }
+    fn is_open(&self) -> bool {
+        match self {
+            GarnetConn::Single(c) => c.is_open(),
+            GarnetConn::Cluster(c) => c.is_open(),
+        }
+    }
+}
+
+/// The client(s) used to (re)build pooled connections.
+enum GarnetClient {
+    Single(redis::Client),
+    Cluster(redis::cluster::ClusterClient),
+}
+
+impl GarnetClient {
+    fn new_conn(&self, timeout: std::time::Duration) -> redis::RedisResult<GarnetConn> {
+        match self {
+            GarnetClient::Single(c) => {
+                let conn = c.get_connection()?;
+                conn.set_read_timeout(Some(timeout))?;
+                conn.set_write_timeout(Some(timeout))?;
+                Ok(GarnetConn::Single(conn))
+            }
+            GarnetClient::Cluster(cc) => {
+                let mut conn = cc.get_connection()?;
+                conn.set_read_timeout(Some(timeout))?;
+                conn.set_write_timeout(Some(timeout))?;
+                Ok(GarnetConn::Cluster(conn))
+            }
+        }
+    }
+}
+
 pub(crate) struct GarnetFpStore<T: VectorRepr> {
-    pool: Vec<std::sync::Mutex<redis::Connection>>,
+    pool: Vec<std::sync::Mutex<GarnetConn>>,
     /// Client + per-call timeout kept for rebuilding a connection after an error: a timed-out sync
     /// connection is poisoned (the late reply desynchronizes the RESP stream), so `run()` replaces
     /// it rather than reuse it.
-    client: redis::Client,
+    client: GarnetClient,
     timeout: std::time::Duration,
     next: std::sync::atomic::AtomicUsize,
     prefix: String,
@@ -290,32 +370,39 @@ impl<T: VectorRepr> GarnetFpStore<T> {
         max_vectors: usize,
         num_start_points: usize,
     ) -> ANNResult<Self> {
-        let endpoint = cfg.endpoints.first().ok_or_else(|| {
-            diskann::ANNError::message("garnet fp backend: endpoints is empty".to_string())
-        })?;
-        let url = if endpoint.starts_with("redis://") || endpoint.starts_with("rediss://") {
-            endpoint.clone()
-        } else {
-            format!("redis://{endpoint}")
+        if cfg.endpoints.is_empty() {
+            return Err(diskann::ANNError::message(
+                "garnet fp backend: endpoints is empty".to_string(),
+            ));
+        }
+        let normalize = |e: &String| -> String {
+            if e.starts_with("redis://") || e.starts_with("rediss://") {
+                e.clone()
+            } else {
+                format!("redis://{e}")
+            }
         };
-        let client = redis::Client::open(url.as_str()).map_err(|e| {
-            diskann::ANNError::message(format!("garnet fp backend: bad endpoint {endpoint}: {e}"))
-        })?;
+        let client = if cfg.cluster {
+            let nodes: Vec<String> = cfg.endpoints.iter().map(normalize).collect();
+            GarnetClient::Cluster(redis::cluster::ClusterClient::new(nodes).map_err(|e| {
+                diskann::ANNError::message(format!("garnet fp backend: bad cluster endpoints: {e}"))
+            })?)
+        } else {
+            let url = normalize(&cfg.endpoints[0]);
+            GarnetClient::Single(redis::Client::open(url.as_str()).map_err(|e| {
+                diskann::ANNError::message(format!(
+                    "garnet fp backend: bad endpoint {}: {e}",
+                    cfg.endpoints[0]
+                ))
+            })?)
+        };
 
         let timeout = std::time::Duration::from_millis(cfg.timeout_ms.max(1));
         let pool_size = cfg.pool_size.max(1);
         let mut pool = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
-            let conn = client.get_connection().map_err(|e| {
-                diskann::ANNError::message(format!(
-                    "garnet fp backend: connect to {endpoint} failed: {e}"
-                ))
-            })?;
-            conn.set_read_timeout(Some(timeout)).map_err(|e| {
-                diskann::ANNError::message(format!("garnet fp backend: set_read_timeout: {e}"))
-            })?;
-            conn.set_write_timeout(Some(timeout)).map_err(|e| {
-                diskann::ANNError::message(format!("garnet fp backend: set_write_timeout: {e}"))
+            let conn = client.new_conn(timeout).map_err(|e| {
+                diskann::ANNError::message(format!("garnet fp backend: connect failed: {e}"))
             })?;
             pool.push(std::sync::Mutex::new(conn));
         }
@@ -348,11 +435,9 @@ impl<T: VectorRepr> GarnetFpStore<T> {
     /// stream — every subsequent command on that connection would read a stale reply — so a failed
     /// connection must never be reused. If the server is down the rebuild fails quickly and the old
     /// connection stays (still broken, but the breaker opens and its half-open probe retries).
-    fn refresh(&self, guard: &mut redis::Connection) -> bool {
-        match self.client.get_connection() {
+    fn refresh(&self, guard: &mut GarnetConn) -> bool {
+        match self.client.new_conn(self.timeout) {
             Ok(fresh) => {
-                let _ = fresh.set_read_timeout(Some(self.timeout));
-                let _ = fresh.set_write_timeout(Some(self.timeout));
                 *guard = fresh;
                 true
             }
@@ -368,7 +453,7 @@ impl<T: VectorRepr> GarnetFpStore<T> {
     /// A second consecutive failure is returned (and counted by the breaker).
     fn run<R>(
         &self,
-        op: impl Fn(&mut redis::Connection) -> redis::RedisResult<R>,
+        op: impl Fn(&mut GarnetConn) -> redis::RedisResult<R>,
     ) -> Result<R, redis::RedisError> {
         use std::sync::atomic::Ordering;
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
