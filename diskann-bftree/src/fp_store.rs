@@ -239,7 +239,11 @@ pub struct GarnetConfig {
     pub pool_size: usize,
     /// Consecutive failures before the breaker opens.
     pub breaker_threshold: u32,
-    /// Key prefix namespacing the FP store (default `"fp:"`).
+    /// Key prefix namespacing this index's FP vectors: keys are `"{key_prefix}{slot}"`. Indices that
+    /// share a Garnet server or cluster MUST use distinct prefixes — slot numbers overlap between
+    /// indices, so a shared prefix silently overwrites the other index's vectors. Default `"fp:"`.
+    /// The prefix is stamped into snapshots and checked on load. It must be non-empty and must not
+    /// contain `{` or `}` (a cluster hash tag would pin every key of the index to one node).
     pub key_prefix: String,
     /// Whether the endpoints form a Redis-protocol **cluster** (slot-sharded, MOVED redirections).
     /// `false` (default): a single standalone server — first endpoint used. `true`: the endpoints
@@ -375,6 +379,21 @@ impl<T: VectorRepr> GarnetFpStore<T> {
                 "garnet fp backend: endpoints is empty".to_string(),
             ));
         }
+        if cfg.key_prefix.is_empty() {
+            return Err(diskann::ANNError::message(
+                "garnet fp backend: key_prefix must not be empty".to_string(),
+            ));
+        }
+        if cfg.key_prefix.contains('{') || cfg.key_prefix.contains('}') {
+            // In cluster mode `{...}` is a hash tag: every key would hash to the same slot, putting
+            // the whole index on one node. Reject in both modes so a config moved from standalone
+            // to cluster can't silently change data placement.
+            return Err(diskann::ANNError::message(format!(
+                "garnet fp backend: key_prefix {:?} must not contain '{{' or '}}' \
+                 (cluster hash tags would place every key of the index on a single node)",
+                cfg.key_prefix
+            )));
+        }
         let normalize = |e: &String| -> String {
             if e.starts_with("redis://") || e.starts_with("rediss://") {
                 e.clone()
@@ -467,6 +486,20 @@ impl<T: VectorRepr> GarnetFpStore<T> {
                 return Ok(v);
             }
             Err(e) => {
+                // A MOVED/ASK redirection on a single-node connection means the endpoint is a
+                // cluster node but `cluster` is false in the config. Retrying cannot help and the
+                // raw error ("Moved: 7383 host:port") doesn't say what to change, so fail fast with
+                // the fix spelled out. Not counted against the breaker: it is a config error, not
+                // an availability problem.
+                if matches!(&*guard, GarnetConn::Single(_))
+                    && matches!(e.kind(), redis::ErrorKind::Moved | redis::ErrorKind::Ask)
+                {
+                    return Err(redis::RedisError::from((
+                        redis::ErrorKind::ClientError,
+                        "garnet endpoint is a cluster node but fp_garnet.cluster is false",
+                        format!("set \"cluster\": true in fp_garnet (server replied: {e})"),
+                    )));
+                }
                 self.breaker.on_failure();
                 // Rebuild the connection; if that fails (server down), don't retry — fail fast.
                 if !self.refresh(&mut guard) {
@@ -672,6 +705,14 @@ impl<T: VectorRepr> FpStore<T> {
     }
 
     /// Whether the garnet backend is active (used to gate the not-yet-decoupled save/load path).
+    /// The garnet key prefix in use, or `None` for the bf-tree backend.
+    pub(super) fn key_prefix(&self) -> Option<&str> {
+        match self {
+            FpStore::BfTree(_) => None,
+            FpStore::Garnet(s) => Some(s.prefix.as_str()),
+        }
+    }
+
     pub(super) fn is_garnet(&self) -> bool {
         matches!(self, FpStore::Garnet(_))
     }

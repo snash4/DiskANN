@@ -1673,9 +1673,19 @@ pub struct SavedParams {
     /// no FP store — load must go through `load_with_backend` with the garnet endpoints.
     #[serde(default = "default_fp_backend")]
     pub fp_backend: String,
+    /// Garnet key prefix the FP vectors were written under (garnet mode only; ignored for bftree).
+    /// Defaults to `"fp:"` — the only prefix that existed before this field — so earlier garnet
+    /// snapshots load unchanged. A garnet load whose configured prefix differs is refused: every
+    /// rerank lookup would miss and searches would return empty results instead of failing.
+    #[serde(default = "default_fp_key_prefix")]
+    pub fp_key_prefix: String,
 }
 
 /// Default [`SavedParams::id_width`] for legacy indexes (all of which were `u32`).
+fn default_fp_key_prefix() -> String {
+    "fp:".to_string()
+}
+
 fn default_fp_backend() -> String {
     "bftree".to_string()
 }
@@ -1871,6 +1881,7 @@ where
             use_snapshot: self.use_snapshot,
             id_width: std::mem::size_of::<I>(),
             fp_backend: "bftree".to_string(),
+            fp_key_prefix: default_fp_key_prefix(),
         };
 
         debug_assert_eq!(
@@ -2022,6 +2033,11 @@ where
             use_snapshot: self.use_snapshot,
             id_width: std::mem::size_of::<I>(),
             fp_backend: if is_garnet { "garnet" } else { "bftree" }.to_string(),
+            fp_key_prefix: self
+                .full_vectors
+                .key_prefix()
+                .map(str::to_string)
+                .unwrap_or_else(default_fp_key_prefix),
         };
 
         debug_assert_eq!(
@@ -2147,12 +2163,25 @@ where
                     vector_index,
                 )))
             }
-            FpBackendSelection::Garnet(garnet_cfg) => FpStore::Garnet(GarnetFpStore::connect(
-                &garnet_cfg,
-                saved_params.dim,
-                saved_params.max_points,
-                saved_params.frozen_points.get(),
-            )?),
+            FpBackendSelection::Garnet(garnet_cfg) => {
+                if garnet_cfg.key_prefix != saved_params.fp_key_prefix {
+                    return Err(ANNError::message(lazy_format!(
+                        move,
+                        "FP key prefix mismatch: snapshot's vectors are under key_prefix {:?} but \
+                         the config requests {:?} — every rerank lookup would miss; set \
+                         fp_garnet.key_prefix to {:?}",
+                        saved_params.fp_key_prefix,
+                        garnet_cfg.key_prefix,
+                        saved_params.fp_key_prefix
+                    )));
+                }
+                FpStore::Garnet(GarnetFpStore::connect(
+                    &garnet_cfg,
+                    saved_params.dim,
+                    saved_params.max_points,
+                    saved_params.frozen_points.get(),
+                )?)
+            }
         };
 
         let adjacency_list_index = load_bftree(
