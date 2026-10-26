@@ -464,22 +464,40 @@ where
     }
 }
 
-/// Trait for types that may need cleanup during hard-delete.
+/// Trait for types that may need cleanup during hard-delete, and that can answer liveness.
 ///
-/// `QuantVectorProvider` implements this to delete its quantized embedding.
-/// `NoStore` implements this as a no-op.
+/// `QuantVectorProvider` implements this to delete its quantized embedding and to report whether
+/// one is present. `NoStore` implements deletion as a no-op and has no liveness to report.
 pub(crate) trait DeleteQuant {
     fn delete_vector(&self, id: usize);
+
+    /// Liveness of `id` according to the quantized store: `Some(Ok(true))` present,
+    /// `Some(Ok(false))` absent/deleted, `Some(Err(_))` unreadable. `None` when there is no
+    /// quantized store, in which case the caller falls back to the full-precision store.
+    fn is_present(&self, id: usize) -> Option<ANNResult<bool>>;
 }
 
 impl DeleteQuant for QuantVectorProvider {
     fn delete_vector(&self, id: usize) {
         QuantVectorProvider::delete_vector(self, id);
     }
+
+    fn is_present(&self, id: usize) -> Option<ANNResult<bool>> {
+        let mut buf = vec![0u8; self.quantizer.bytes()];
+        Some(match self.get_vector_into(id, &mut buf) {
+            Ok(()) => Ok(true),
+            Err(RankedError::Transient(_)) => Ok(false),
+            Err(RankedError::Error(e)) => Err(e),
+        })
+    }
 }
 
 impl DeleteQuant for NoStore {
     fn delete_vector(&self, _id: usize) {}
+
+    fn is_present(&self, _id: usize) -> Option<ANNResult<bool>> {
+        None
+    }
 }
 
 /// Hard-delete implementation for `BfTreeProvider`.
@@ -519,8 +537,11 @@ where
         // Only delete vector data here. Neighbor adjacency cleanup (zeroing the
         // deleted vertex's edge list and patching neighbors-of-neighbors) is
         // handled by `DiskANNIndex::inplace_delete` → `drop_adj_list`.
-        self.full_vectors.delete_vector(id.as_index());
+        // Quantized code first: for a quantized index it is the liveness record (see
+        // `status_by_internal_id`), so the vertex reads as deleted — and stops being scored by
+        // traversal — at the earliest point. The FP vector (possibly in a remote store) follows.
         self.quant_vectors.delete_vector(id.as_index());
+        self.full_vectors.delete_vector(id.as_index());
 
         std::future::ready(Ok(()))
     }
@@ -534,16 +555,37 @@ where
         self.status_by_internal_id(context, *gid)
     }
 
+    /// Liveness of a vertex.
+    ///
+    /// For a **quantized** index this is answered by the quantized store, not the full-precision
+    /// store. The quantized store lives in the same bf-tree as the graph, is snapshotted and
+    /// replayed together with it, and is always local — whereas the FP store may be remote
+    /// (Garnet) and outside the snapshot. Consequences:
+    /// - no network round trip per check (`inplace_delete` checks every neighbour of the deleted
+    ///   vertex: ~one check per edge);
+    /// - liveness cannot drift from the graph (Garnet outage, a failed DEL leaving a stale key, a
+    ///   Garnet behind the snapshot after restart);
+    /// - with replicas that each own a graph+quant copy but share one FP store, each replica's
+    ///   answer reflects its own WAL position, keeping replica state deterministic.
+    ///
+    /// Correctness: `set_element` writes the quantized code before any edge can point to the new
+    /// vertex, and `delete` removes the quantized code first, so "quant code present" ⇔ "live".
+    /// A full-precision-only index (no quantized store) falls back to the FP store, as before.
     fn status_by_internal_id(
         &self,
         _context: &Self::Context,
         id: Self::InternalId,
     ) -> impl std::future::Future<Output = Result<diskann::provider::ElementStatus, Self::Error>> + Send
     {
-        let status = match self.full_vectors.get_vector_sync(id.as_index()) {
-            Ok(_) => Ok(ElementStatus::Valid),
-            Err(RankedError::Transient(_)) => Ok(ElementStatus::Deleted),
-            Err(RankedError::Error(e)) => Err(e),
+        let status = match self.quant_vectors.is_present(id.as_index()) {
+            Some(Ok(true)) => Ok(ElementStatus::Valid),
+            Some(Ok(false)) => Ok(ElementStatus::Deleted),
+            Some(Err(e)) => Err(e),
+            None => match self.full_vectors.get_vector_sync(id.as_index()) {
+                Ok(_) => Ok(ElementStatus::Valid),
+                Err(RankedError::Transient(_)) => Ok(ElementStatus::Deleted),
+                Err(RankedError::Error(e)) => Err(e),
+            },
         };
         std::future::ready(status)
     }
@@ -2336,6 +2378,81 @@ mod tests {
             5, k
         );
         assert_eq!(*neighbors[0].id(), 3);
+    }
+
+    /// Liveness of a quantized index follows the quantized store, not the full-precision store:
+    /// a missing FP vector does not make a vertex dead, and a stale FP vector does not make a
+    /// deleted vertex alive.
+    #[tokio::test]
+    async fn test_quantized_status_follows_quant_store() {
+        let ctx = &DefaultContext;
+        let start_point = Matrix::new(Init(|| 0.0f32), 1, 5);
+        let provider: BfTreeProvider<f32, QuantVectorProvider, u32> = BfTreeProvider::new(
+            BfTreeProviderParameters {
+                fp_backend: Default::default(),
+                max_points: 10,
+                num_start_points: NonZeroUsize::new(1).unwrap(),
+                dim: 5,
+                metric: Metric::L2,
+                max_degree: 8,
+                vector_provider_config: Config::default(),
+                quant_vector_provider_config: Config::default(),
+                neighbor_list_provider_config: Config::default(),
+                graph_params: None,
+                use_snapshot: false,
+            },
+            start_point.as_view(),
+            create_test_quantizer(5),
+        )
+        .unwrap();
+
+        for i in 0u32..4 {
+            let v: Vec<f32> = (0..5).map(|j| (i * 5 + j) as f32).collect();
+            provider.set_element(ctx, &i, &v).await.unwrap();
+            assert_eq!(
+                provider.status_by_internal_id(ctx, i).await.unwrap(),
+                ElementStatus::Valid
+            );
+        }
+
+        // FP vector missing, quantized code present -> still a live vertex.
+        provider.full_vectors.delete_vector(0);
+        assert_eq!(
+            provider.status_by_internal_id(ctx, 0).await.unwrap(),
+            ElementStatus::Valid
+        );
+
+        // Quantized code missing, FP vector present (e.g. a stale FP key) -> deleted.
+        provider.quant_vectors.delete_vector(1);
+        assert_eq!(
+            provider.status_by_internal_id(ctx, 1).await.unwrap(),
+            ElementStatus::Deleted
+        );
+
+        // The bulk path agrees.
+        let mut seen: Vec<(u32, ElementStatus)> = Vec::new();
+        provider
+            .statuses_unordered(ctx, [0u32, 1, 2].into_iter(), |s, id| {
+                seen.push((id, s.unwrap()))
+            })
+            .await
+            .unwrap();
+        seen.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            seen,
+            vec![
+                (0, ElementStatus::Valid),
+                (1, ElementStatus::Deleted),
+                (2, ElementStatus::Valid)
+            ]
+        );
+
+        // A full delete removes both.
+        provider.delete(ctx, &2).await.unwrap();
+        assert_eq!(
+            provider.status_by_internal_id(ctx, 2).await.unwrap(),
+            ElementStatus::Deleted
+        );
     }
 
     /// Build and search a quantized index whose vertex ids are `u64` rather than the

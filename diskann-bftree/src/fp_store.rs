@@ -597,12 +597,27 @@ impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
         }
         let keys: Vec<String> = slots.iter().map(|&s| self.key(s)).collect();
         let values: Vec<Option<Vec<u8>>> = self
-            .run(|conn| {
-                let mut cmd = redis::cmd("MGET");
-                for k in &keys {
-                    cmd.arg(k);
+            .run(|conn| match conn {
+                // Standalone: one MGET, one round trip.
+                GarnetConn::Single(c) => {
+                    let mut cmd = redis::cmd("MGET");
+                    for k in &keys {
+                        cmd.arg(k);
+                    }
+                    cmd.query::<Vec<Option<Vec<u8>>>>(c)
                 }
-                cmd.query::<Vec<Option<Vec<u8>>>>(conn)
+                // Cluster: the sync cluster client splits a multi-key MGET *per hash slot* and
+                // sends the pieces one after another (~one round trip per key). A cluster pipeline
+                // instead groups single-key GETs by owning node, sends every node's batch, then
+                // reads the replies: one round trip of depth regardless of node count, with MOVED
+                // retried by the client.
+                GarnetConn::Cluster(c) => {
+                    let mut pipe = redis::cluster::cluster_pipe();
+                    for k in &keys {
+                        pipe.cmd("GET").arg(k);
+                    }
+                    pipe.query::<Vec<Option<Vec<u8>>>>(c)
+                }
             })
             .map_err(|e| diskann::ANNError::message(format!("garnet fp mget: {e}")))?;
         out.reserve(slots.len());
