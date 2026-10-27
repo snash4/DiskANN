@@ -18,7 +18,7 @@ pub mod vectors;
 mod fp_store;
 mod locks;
 
-pub use fp_store::{FpBackendSelection, GarnetConfig};
+pub use fp_store::{fp_fetch_stats, FpBackendSelection, FpFetchStats, GarnetConfig, HistogramSnapshot};
 pub use id::BfTreeId;
 
 // Accessors

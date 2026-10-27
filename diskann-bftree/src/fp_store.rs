@@ -474,12 +474,25 @@ impl<T: VectorRepr> GarnetFpStore<T> {
         &self,
         op: impl Fn(&mut GarnetConn) -> redis::RedisResult<R>,
     ) -> Result<R, redis::RedisError> {
+        self.run_timed(op, None)
+    }
+
+    /// [`Self::run`], optionally recording the instant the pooled connection was checked out
+    /// (used to separate pool-contention time from call time in the fetch timing).
+    fn run_timed<R>(
+        &self,
+        op: impl Fn(&mut GarnetConn) -> redis::RedisResult<R>,
+        checked_out: Option<&mut std::time::Instant>,
+    ) -> Result<R, redis::RedisError> {
         use std::sync::atomic::Ordering;
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
         let mut guard = match self.pool[idx].lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if let Some(t) = checked_out {
+            *t = std::time::Instant::now();
+        }
         match op(&mut guard) {
             Ok(v) => {
                 self.breaker.on_success();
@@ -595,9 +608,12 @@ impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
                 "garnet fp backend unavailable (breaker open)".to_string(),
             ));
         }
+        let t_enter = std::time::Instant::now();
         let keys: Vec<String> = slots.iter().map(|&s| self.key(s)).collect();
+        let t_prep = std::time::Instant::now();
+        let mut t_checkout = t_prep;
         let values: Vec<Option<Vec<u8>>> = self
-            .run(|conn| match conn {
+            .run_timed(|conn| match conn {
                 // Standalone: one MGET, one round trip.
                 GarnetConn::Single(c) => {
                     let mut cmd = redis::cmd("MGET");
@@ -618,8 +634,9 @@ impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
                     }
                     pipe.query::<Vec<Option<Vec<u8>>>>(c)
                 }
-            })
+            }, Some(&mut t_checkout))
             .map_err(|e| diskann::ANNError::message(format!("garnet fp mget: {e}")))?;
+        let t_call = std::time::Instant::now();
         out.reserve(slots.len());
         for val in values {
             out.push(val.and_then(|bytes| self.decode(&bytes)));
@@ -628,6 +645,10 @@ impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
         while out.len() < slots.len() {
             out.push(None);
         }
+        FETCH_PREP.record(t_prep - t_enter);
+        FETCH_CHECKOUT.record(t_checkout - t_prep);
+        FETCH_CALL.record(t_call - t_checkout);
+        FETCH_DECODE.record(t_call.elapsed());
         Ok(())
     }
 
@@ -706,10 +727,13 @@ impl<T: VectorRepr> FpStore<T> {
 
     /// Batched fetch — the rerank read. One call per query regardless of candidate count.
     pub(super) fn get_many(&self, slots: &[usize], out: &mut Vec<Option<Vec<T>>>) -> ANNResult<()> {
-        match self {
+        let t0 = std::time::Instant::now();
+        let result = match self {
             FpStore::BfTree(s) => s.get_many(slots, out),
             FpStore::Garnet(s) => s.get_many(slots, out),
-        }
+        };
+        FETCH_TOTAL.record(t0.elapsed());
+        result
     }
 
     /// Whether a rerank that fails against this backend may **degrade** to quantized-only ordering
@@ -818,5 +842,155 @@ impl<T: VectorRepr> FpStore<T> {
                 unreachable!("FP save/load is bf-tree-only until Phase 4; garnet has no bf-tree")
             }
         }
+    }
+}
+
+// ================================================================================================
+// Rerank FP-fetch timing (instrumentation)
+// ================================================================================================
+//
+// Process-wide latency histograms for `FpStore::get_many` — the per-query rerank fetch of the
+// candidates' full-precision vectors. Lock-free (relaxed atomics), ~10 atomic adds per fetch.
+//
+// `total` is recorded for both backends, so `garnet total − bftree total` is the extra fetch cost of
+// the remote store as seen inside the service. For garnet, the fetch is split into phases:
+//   prep     — building the keys
+//   checkout — waiting for a pooled connection (pool contention)
+//   call     — request + network + Garnet + redis-rs RESP parsing into owned `Vec<u8>` per value
+//   decode   — our copy of each value into a `Vec<T>` (second copy / allocation per vector)
+// Read with `fp_fetch_stats()`; diff two snapshots with `since()` for an interval.
+
+const HIST_BUCKET_NS: u64 = 5_000; // 5 µs resolution
+const HIST_BUCKETS: usize = 1_001; // 0..5 ms, last bucket = overflow (>= 5 ms)
+
+struct LatencyHistogram {
+    buckets: [std::sync::atomic::AtomicU64; HIST_BUCKETS],
+    sum_ns: std::sync::atomic::AtomicU64,
+    count: std::sync::atomic::AtomicU64,
+}
+
+impl LatencyHistogram {
+    const fn new() -> Self {
+        Self {
+            buckets: [const { std::sync::atomic::AtomicU64::new(0) }; HIST_BUCKETS],
+            sum_ns: std::sync::atomic::AtomicU64::new(0),
+            count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, d: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ns = d.as_nanos().min(u64::MAX as u128) as u64;
+        let i = ((ns / HIST_BUCKET_NS) as usize).min(HIST_BUCKETS - 1);
+        self.buckets[i].fetch_add(1, Relaxed);
+        self.sum_ns.fetch_add(ns, Relaxed);
+        self.count.fetch_add(1, Relaxed);
+    }
+
+    fn snapshot(&self) -> HistogramSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        HistogramSnapshot {
+            buckets: self.buckets.iter().map(|b| b.load(Relaxed)).collect(),
+            sum_ns: self.sum_ns.load(Relaxed),
+            count: self.count.load(Relaxed),
+        }
+    }
+}
+
+/// A point-in-time copy of one latency histogram (5 µs buckets up to 5 ms).
+#[derive(Clone, Debug, Default)]
+pub struct HistogramSnapshot {
+    buckets: Vec<u64>,
+    sum_ns: u64,
+    count: u64,
+}
+
+impl HistogramSnapshot {
+    /// The histogram of samples recorded after `earlier` (an older snapshot of the same histogram).
+    pub fn since(&self, earlier: &HistogramSnapshot) -> HistogramSnapshot {
+        HistogramSnapshot {
+            buckets: self
+                .buckets
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b.saturating_sub(earlier.buckets.get(i).copied().unwrap_or(0)))
+                .collect(),
+            sum_ns: self.sum_ns.saturating_sub(earlier.sum_ns),
+            count: self.count.saturating_sub(earlier.count),
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub fn mean_us(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_ns as f64 / self.count as f64 / 1_000.0
+        }
+    }
+
+    /// Approximate percentile in µs (upper edge of the bucket holding it; 5 µs resolution).
+    /// Returns 5000.0 if the percentile falls in the overflow bucket (>= 5 ms).
+    pub fn percentile_us(&self, p: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let target = ((p / 100.0) * self.count as f64).ceil().max(1.0) as u64;
+        let mut cum = 0u64;
+        for (i, &b) in self.buckets.iter().enumerate() {
+            cum += b;
+            if cum >= target {
+                return ((i as u64 + 1) * HIST_BUCKET_NS) as f64 / 1_000.0;
+            }
+        }
+        (HIST_BUCKETS as u64 * HIST_BUCKET_NS) as f64 / 1_000.0
+    }
+}
+
+/// Snapshot of the rerank FP-fetch timing histograms (see module docs above).
+#[derive(Clone, Debug, Default)]
+pub struct FpFetchStats {
+    /// Whole `get_many`, both backends.
+    pub total: HistogramSnapshot,
+    /// Garnet only: building keys.
+    pub prep: HistogramSnapshot,
+    /// Garnet only: waiting for a pooled connection.
+    pub checkout: HistogramSnapshot,
+    /// Garnet only: request, network, Garnet, and redis-rs reply parsing.
+    pub call: HistogramSnapshot,
+    /// Garnet only: copying each value into a `Vec<T>`.
+    pub decode: HistogramSnapshot,
+}
+
+impl FpFetchStats {
+    /// Stats for the samples recorded after `earlier`.
+    pub fn since(&self, earlier: &FpFetchStats) -> FpFetchStats {
+        FpFetchStats {
+            total: self.total.since(&earlier.total),
+            prep: self.prep.since(&earlier.prep),
+            checkout: self.checkout.since(&earlier.checkout),
+            call: self.call.since(&earlier.call),
+            decode: self.decode.since(&earlier.decode),
+        }
+    }
+}
+
+static FETCH_TOTAL: LatencyHistogram = LatencyHistogram::new();
+static FETCH_PREP: LatencyHistogram = LatencyHistogram::new();
+static FETCH_CHECKOUT: LatencyHistogram = LatencyHistogram::new();
+static FETCH_CALL: LatencyHistogram = LatencyHistogram::new();
+static FETCH_DECODE: LatencyHistogram = LatencyHistogram::new();
+
+/// Cumulative (since process start) rerank FP-fetch timing.
+pub fn fp_fetch_stats() -> FpFetchStats {
+    FpFetchStats {
+        total: FETCH_TOTAL.snapshot(),
+        prep: FETCH_PREP.snapshot(),
+        checkout: FETCH_CHECKOUT.snapshot(),
+        call: FETCH_CALL.snapshot(),
+        decode: FETCH_DECODE.snapshot(),
     }
 }
