@@ -252,6 +252,11 @@ pub struct GarnetConfig {
     /// survives any listed seed being down). The cluster client follows redirections, tracks
     /// topology changes, and splits multi-key MGETs per owning node.
     pub cluster: bool,
+    /// Cluster mode only: serve the rerank fetch through the lean per-node reader
+    /// (`lean_fetch.rs`) instead of redis-rs's cluster pipeline. Falls back to redis-rs for any
+    /// fetch that hits a redirection, error or timeout. Ignored in standalone mode and for
+    /// TLS/authenticated endpoints. Writes always use redis-rs.
+    pub lean_fetch: bool,
 }
 
 /// Which backend stores the full-precision vectors — the user-facing selection carried in
@@ -341,7 +346,7 @@ impl GarnetClient {
                 Ok(GarnetConn::Single(conn))
             }
             GarnetClient::Cluster(cc) => {
-                let mut conn = cc.get_connection()?;
+                let conn = cc.get_connection()?;
                 conn.set_read_timeout(Some(timeout))?;
                 conn.set_write_timeout(Some(timeout))?;
                 Ok(GarnetConn::Cluster(conn))
@@ -360,6 +365,8 @@ pub(crate) struct GarnetFpStore<T: VectorRepr> {
     next: std::sync::atomic::AtomicUsize,
     prefix: String,
     breaker: CircuitBreaker,
+    /// Lean rerank-fetch path (cluster mode with `lean_fetch`), else `None`.
+    pub(crate) lean: Option<crate::lean_fetch::LeanCluster>,
     dim: usize,
     max_vectors: usize,
     num_start_points: usize,
@@ -426,10 +433,20 @@ impl<T: VectorRepr> GarnetFpStore<T> {
             pool.push(std::sync::Mutex::new(conn));
         }
 
+        // Lean fetch: every endpoint must be plain TCP without auth, else stay on redis-rs.
+        let lean = if cfg.cluster && cfg.lean_fetch {
+            let seeds: Option<Vec<String>> =
+                cfg.endpoints.iter().map(|e| crate::lean_fetch::lean_seed(e)).collect();
+            seeds.map(|seeds| crate::lean_fetch::LeanCluster::new(seeds, timeout, pool_size))
+        } else {
+            None
+        };
+
         Ok(Self {
             pool,
             client,
             timeout,
+            lean,
             next: std::sync::atomic::AtomicUsize::new(0),
             prefix: cfg.key_prefix.clone(),
             breaker: CircuitBreaker::new(
@@ -609,6 +626,31 @@ impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
             ));
         }
         let t_enter = std::time::Instant::now();
+        if let Some(lean) = &self.lean {
+            let mut timing = None;
+            match lean.fetch(&self.prefix, slots, out, |b| self.decode(b), &mut timing) {
+                Ok(()) => {
+                    self.breaker.on_success();
+                    LEAN_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(t) = timing {
+                        FETCH_CHECKOUT.record(t.checked_out - t_enter);
+                        FETCH_PREP.record(t.prepared - t.checked_out);
+                        FETCH_CALL.record(t.received - t.prepared);
+                        FETCH_DECODE.record(t.received.elapsed());
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Serve this fetch through redis-rs below (it follows redirections and retries);
+                    // re-read the slot table unless the reply was merely malformed.
+                    LEAN_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !matches!(e, crate::lean_fetch::LeanError::Protocol(_)) {
+                        lean.refresh();
+                    }
+                    out.clear();
+                }
+            }
+        }
         let keys: Vec<String> = slots.iter().map(|&s| self.key(s)).collect();
         let t_prep = std::time::Instant::now();
         let mut t_checkout = t_prep;
@@ -963,6 +1005,10 @@ pub struct FpFetchStats {
     pub call: HistogramSnapshot,
     /// Garnet only: copying each value into a `Vec<T>`.
     pub decode: HistogramSnapshot,
+    /// Garnet cluster only: fetches served by the lean per-node reader.
+    pub lean_fetches: u64,
+    /// Garnet cluster only: lean fetches that fell back to redis-rs (redirection, error, timeout).
+    pub lean_fallbacks: u64,
 }
 
 impl FpFetchStats {
@@ -974,6 +1020,8 @@ impl FpFetchStats {
             checkout: self.checkout.since(&earlier.checkout),
             call: self.call.since(&earlier.call),
             decode: self.decode.since(&earlier.decode),
+            lean_fetches: self.lean_fetches.saturating_sub(earlier.lean_fetches),
+            lean_fallbacks: self.lean_fallbacks.saturating_sub(earlier.lean_fallbacks),
         }
     }
 }
@@ -983,6 +1031,8 @@ static FETCH_PREP: LatencyHistogram = LatencyHistogram::new();
 static FETCH_CHECKOUT: LatencyHistogram = LatencyHistogram::new();
 static FETCH_CALL: LatencyHistogram = LatencyHistogram::new();
 static FETCH_DECODE: LatencyHistogram = LatencyHistogram::new();
+static LEAN_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LEAN_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cumulative (since process start) rerank FP-fetch timing.
 pub fn fp_fetch_stats() -> FpFetchStats {
@@ -992,5 +1042,7 @@ pub fn fp_fetch_stats() -> FpFetchStats {
         checkout: FETCH_CHECKOUT.snapshot(),
         call: FETCH_CALL.snapshot(),
         decode: FETCH_DECODE.snapshot(),
+        lean_fetches: LEAN_FETCHES.load(std::sync::atomic::Ordering::Relaxed),
+        lean_fallbacks: LEAN_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
     }
 }

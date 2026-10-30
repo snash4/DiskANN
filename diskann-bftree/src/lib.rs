@@ -16,6 +16,7 @@ pub mod quant;
 pub mod vectors;
 
 mod fp_store;
+mod lean_fetch;
 mod locks;
 
 pub use fp_store::{fp_fetch_stats, FpBackendSelection, FpFetchStats, GarnetConfig, HistogramSnapshot};
