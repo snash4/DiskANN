@@ -40,6 +40,49 @@ const REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// Read granularity: the buffer always has at least this much free space before a read.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// How a lean fetch waits for the nodes' replies after sending every node its batch.
+///
+/// Each time the fetching thread goes to sleep waiting for a socket, it has to be woken and
+/// rescheduled when data arrives — on a host whose cores are all busy that wake-up can be late,
+/// and a fetch that sleeps several times has several chances to be late. The modes differ in how
+/// often the thread sleeps; the `fp_fetch` health line reports the average sleeps per fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeanWait {
+    /// Read node by node with blocking reads, in node order (the original behaviour). Sleeps
+    /// whenever the node being read has no data yet, even if another node's reply is waiting.
+    #[default]
+    Sequential,
+    /// Wait on all pending nodes at once with `poll(2)` and read whichever has data, so a reply
+    /// that arrives first is processed first and the thread sleeps only when no node has data.
+    Poll,
+    /// Like `Poll`, but first spin on non-blocking reads for up to this many microseconds before
+    /// sleeping — replies that arrive within the window need no wake-up at all (costs CPU).
+    Spin(u32),
+}
+
+impl std::str::FromStr for LeanWait {
+    type Err = String;
+    /// `sequential`, `poll`, `spin` (50 µs) or `spin:<microseconds>`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sequential" | "" => Ok(LeanWait::Sequential),
+            "poll" => Ok(LeanWait::Poll),
+            "spin" => Ok(LeanWait::Spin(50)),
+            other => match other.strip_prefix("spin:") {
+                Some(us) => us
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&u| u > 0 && u <= 100_000)
+                    .map(LeanWait::Spin)
+                    .ok_or_else(|| format!("bad spin time {us:?} (microseconds, 1..=100000)")),
+                None => Err(format!(
+                    "unknown lean wait mode {s:?} (use \"sequential\", \"poll\", \"spin\" or \"spin:<us>\")"
+                )),
+            },
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------------
 // Hash slots
 // ------------------------------------------------------------------------------------------------
@@ -299,9 +342,11 @@ struct LeanConn {
     req: Vec<Vec<u8>>,
     /// Per node: positions (in the caller's slot list) of the keys sent to that node.
     pos: Vec<Vec<usize>>,
-    /// Per node: read buffer and parsed value spans.
+    /// Per node: read buffer, bytes filled, parsed value spans, still waiting for replies.
     rbuf: Vec<Vec<u8>>,
+    filled: Vec<usize>,
     spans: Vec<Vec<Option<(usize, usize)>>>,
+    pending: Vec<bool>,
     /// Scratch for building one key.
     key: Vec<u8>,
 }
@@ -314,7 +359,9 @@ impl LeanConn {
             req: Vec::new(),
             pos: Vec::new(),
             rbuf: Vec::new(),
+            filled: Vec::new(),
             spans: Vec::new(),
+            pending: Vec::new(),
             key: Vec::with_capacity(64),
         }
     }
@@ -330,7 +377,9 @@ impl LeanConn {
         self.req.resize_with(n, Vec::new);
         self.pos.resize_with(n, Vec::new);
         self.rbuf.resize_with(n, Vec::new);
+        self.filled.resize(n, 0);
         self.spans.resize_with(n, Vec::new);
+        self.pending.resize(n, false);
         self.generation = map.generation;
     }
 
@@ -365,6 +414,8 @@ pub(crate) struct LeanTiming {
     pub(crate) checked_out: Instant,
     pub(crate) prepared: Instant,
     pub(crate) received: Instant,
+    /// Times the fetching thread slept waiting for a reply (blocking read or `poll`).
+    pub(crate) sleeps: u32,
 }
 
 /// The lean fetch path of one `GarnetFpStore` (cluster mode).
@@ -373,6 +424,7 @@ pub(crate) struct LeanCluster {
     map: RwLock<Arc<SlotMap>>,
     last_refresh: Mutex<Option<Instant>>,
     timeout: Duration,
+    wait: LeanWait,
     pool: Vec<Mutex<LeanConn>>,
     next: AtomicUsize,
     generation: AtomicU64,
@@ -381,12 +433,15 @@ pub(crate) struct LeanCluster {
 impl LeanCluster {
     /// `seeds`: `host:port` of one or more cluster nodes. A failed initial table fetch is not an
     /// error: every fetch then falls back to redis-rs until a refresh succeeds.
-    pub(crate) fn new(seeds: Vec<String>, timeout: Duration, pool_size: usize) -> Self {
+    pub(crate) fn new(seeds: Vec<String>, timeout: Duration, pool_size: usize, wait: LeanWait) -> Self {
+        // poll/spin need non-blocking receives (MSG_DONTWAIT) and poll(2): Unix only.
+        let wait = if cfg!(unix) { wait } else { LeanWait::Sequential };
         let me = Self {
             seeds,
             map: RwLock::new(Arc::new(SlotMap::empty(0))),
             last_refresh: Mutex::new(None),
             timeout,
+            wait,
             pool: (0..pool_size.max(1)).map(|_| Mutex::new(LeanConn::new())).collect(),
             next: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
@@ -460,7 +515,8 @@ impl LeanCluster {
         let checked_out = Instant::now();
         let conn = &mut *guard;
         conn.adopt(&map);
-        let result = Self::fetch_on(conn, &map, self.timeout, prefix, slots, out, decode, checked_out, timing);
+        let result =
+            Self::fetch_on(conn, &map, self.timeout, self.wait, prefix, slots, out, decode, checked_out, timing);
         if result.is_err() {
             conn.poison();
         }
@@ -472,6 +528,7 @@ impl LeanCluster {
         conn: &mut LeanConn,
         map: &SlotMap,
         timeout: Duration,
+        wait: LeanWait,
         prefix: &str,
         slots: &[usize],
         out: &mut Vec<Option<V>>,
@@ -511,39 +568,24 @@ impl LeanCluster {
             sock.write_all(&conn.req[n]).map_err(LeanError::Io)?;
         }
 
-        // 3. Read each node's replies: large reads, one parse pass once complete.
+        // 3. Collect every node's replies (see `LeanWait` for how the thread waits).
+        let mut active = 0usize;
         for n in 0..map.nodes.len() {
-            let count = conn.pos[n].len();
-            if count == 0 {
-                continue;
-            }
-            let sock = conn.socks[n].as_mut().expect("written above");
-            let buf = &mut conn.rbuf[n];
-            let spans = &mut conn.spans[n];
-            let mut filled = 0usize;
-            loop {
-                if buf.len() < filled + READ_CHUNK {
-                    buf.resize(filled + READ_CHUNK, 0);
-                }
-                let got = sock.read(&mut buf[filled..]).map_err(LeanError::Io)?;
-                if got == 0 {
-                    return Err(LeanError::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "connection closed by server",
-                    )));
-                }
-                filled += got;
-                if let Some(end) = parse_bulk_seq(&buf[..filled], count, spans)? {
-                    if end != filled {
-                        return Err(LeanError::Protocol(format!(
-                            "{} unexpected bytes after the replies",
-                            filled - end
-                        )));
-                    }
-                    break;
-                }
-            }
+            conn.filled[n] = 0;
+            conn.pending[n] = !conn.pos[n].is_empty();
+            active += conn.pending[n] as usize;
         }
+        let sleeps = match wait {
+            LeanWait::Sequential => read_sequential(conn, map.nodes.len())?,
+            #[cfg(unix)]
+            LeanWait::Poll => read_polling(conn, map.nodes.len(), active, timeout, None)?,
+            #[cfg(unix)]
+            LeanWait::Spin(us) => {
+                read_polling(conn, map.nodes.len(), active, timeout, Some(Duration::from_micros(us as u64)))?
+            }
+            #[cfg(not(unix))]
+            _ => read_sequential(conn, map.nodes.len())?,
+        };
         let received = Instant::now();
 
         // 4. Hand each value to the decoder, in the caller's order.
@@ -556,9 +598,162 @@ impl LeanCluster {
                 }
             }
         }
-        *timing = Some(LeanTiming { checked_out, prepared, received });
+        *timing = Some(LeanTiming { checked_out, prepared, received, sleeps });
         Ok(())
     }
+}
+
+/// Make sure node `n`'s buffer has at least `READ_CHUNK` free bytes after the filled part.
+fn ensure_space(conn: &mut LeanConn, n: usize) {
+    let need = conn.filled[n] + READ_CHUNK;
+    if conn.rbuf[n].len() < need {
+        conn.rbuf[n].resize(need, 0);
+    }
+}
+
+/// Account `got` new bytes for node `n` and re-parse; `true` once all its replies are complete.
+fn absorb(conn: &mut LeanConn, n: usize, got: usize) -> Result<bool, LeanError> {
+    if got == 0 {
+        return Err(LeanError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed by server",
+        )));
+    }
+    conn.filled[n] += got;
+    let filled = conn.filled[n];
+    match parse_bulk_seq(&conn.rbuf[n][..filled], conn.pos[n].len(), &mut conn.spans[n])? {
+        Some(end) if end == filled => Ok(true),
+        Some(end) => Err(LeanError::Protocol(format!("{} unexpected bytes after the replies", filled - end))),
+        None => Ok(false),
+    }
+}
+
+/// One receive without blocking: `Ok(Some(n))` bytes read (0 = peer closed), `Ok(None)` = no data.
+#[cfg(unix)]
+fn try_recv(sock: &TcpStream, buf: &mut [u8]) -> Result<Option<usize>, LeanError> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: `buf` is a valid, writable region of `buf.len()` bytes for the whole call.
+        let r = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+        if r >= 0 {
+            return Ok(Some(r as usize));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => return Ok(None),
+            std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(LeanError::Io(e)),
+        }
+    }
+}
+
+/// Node by node, in order; a blocking read whenever the current node has no data yet (one sleep).
+fn read_sequential(conn: &mut LeanConn, nodes: usize) -> Result<u32, LeanError> {
+    let mut sleeps = 0u32;
+    for n in 0..nodes {
+        while conn.pending[n] {
+            ensure_space(conn, n);
+            let filled = conn.filled[n];
+            let sock = conn.socks[n].as_mut().expect("written before reading");
+            let buf = &mut conn.rbuf[n][filled..];
+            #[cfg(unix)]
+            let got = match try_recv(sock, buf)? {
+                Some(k) => k,
+                None => {
+                    sleeps += 1;
+                    sock.read(buf).map_err(LeanError::Io)?
+                }
+            };
+            #[cfg(not(unix))]
+            let got = {
+                sleeps += 1;
+                sock.read(buf).map_err(LeanError::Io)?
+            };
+            if absorb(conn, n, got)? {
+                conn.pending[n] = false;
+            }
+        }
+    }
+    Ok(sleeps)
+}
+
+/// All pending nodes at once: drain whatever has arrived on every socket without blocking, then
+/// (after an optional spin window) sleep in `poll(2)` until any of them has data. The deadline
+/// covers the whole read phase.
+#[cfg(unix)]
+fn read_polling(
+    conn: &mut LeanConn,
+    nodes: usize,
+    mut active: usize,
+    timeout: Duration,
+    spin: Option<Duration>,
+) -> Result<u32, LeanError> {
+    use std::os::fd::AsRawFd;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut sleeps = 0u32;
+    let mut fds: Vec<libc::pollfd> = Vec::with_capacity(nodes);
+    while active > 0 {
+        // Drain every pending socket.
+        let mut progressed = false;
+        for n in 0..nodes {
+            while conn.pending[n] {
+                ensure_space(conn, n);
+                let filled = conn.filled[n];
+                let sock = conn.socks[n].as_ref().expect("written before reading");
+                match try_recv(sock, &mut conn.rbuf[n][filled..])? {
+                    Some(k) => {
+                        progressed = true;
+                        if absorb(conn, n, k)? {
+                            conn.pending[n] = false;
+                            active -= 1;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        if active == 0 {
+            break;
+        }
+        if progressed {
+            continue; // more may have arrived while we parsed
+        }
+        if let Some(window) = spin {
+            if start.elapsed() < window {
+                std::hint::spin_loop();
+                continue;
+            }
+        }
+        // Sleep until any pending socket is readable.
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(LeanError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "lean fetch timed out")));
+        }
+        let ms = (deadline - now).as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+        fds.clear();
+        for n in 0..nodes {
+            if conn.pending[n] {
+                let fd = conn.socks[n].as_ref().expect("written before reading").as_raw_fd();
+                fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+            }
+        }
+        sleeps += 1;
+        // SAFETY: `fds` is a valid array of `fds.len()` pollfd structs for the whole call.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(LeanError::Io(e));
+        }
+        if r == 0 {
+            return Err(LeanError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "lean fetch timed out")));
+        }
+        // Readable, hung up or errored sockets are all handled by the next drain (recv reports them).
+    }
+    Ok(sleeps)
 }
 
 /// Seed `host:port` for the lean path from a configured endpoint, or `None` if the endpoint needs
@@ -641,6 +836,16 @@ mod tests {
     }
 
     #[test]
+    fn wait_modes_parse() {
+        assert_eq!("sequential".parse::<LeanWait>(), Ok(LeanWait::Sequential));
+        assert_eq!("POLL".parse::<LeanWait>(), Ok(LeanWait::Poll));
+        assert_eq!("spin".parse::<LeanWait>(), Ok(LeanWait::Spin(50)));
+        assert_eq!("spin:200".parse::<LeanWait>(), Ok(LeanWait::Spin(200)));
+        assert!("spin:0".parse::<LeanWait>().is_err());
+        assert!("epoll".parse::<LeanWait>().is_err());
+    }
+
+    #[test]
     fn seeds_from_endpoints() {
         assert_eq!(lean_seed("10.0.0.1:6379").as_deref(), Some("10.0.0.1:6379"));
         assert_eq!(lean_seed("redis://10.0.0.1:6380").as_deref(), Some("10.0.0.1:6380"));
@@ -665,17 +870,24 @@ mod tests {
                 let _: () = redis::cmd("SET").arg(format!("leantest:{s}")).arg(val).query(&mut rc).unwrap();
             }
         }
-        let lean = LeanCluster::new(vec![seed.clone()], timeout, 2);
-        assert!(lean.slot_map().nodes.len() >= 2, "expected a multi-node cluster");
-        let mut out = Vec::new();
-        let mut t = None;
-        lean.fetch("leantest:", &slots, &mut out, |b| Some(b.to_vec()), &mut t).unwrap();
         let mut pipe = redis::cluster::cluster_pipe();
         for &s in &slots {
             pipe.cmd("GET").arg(format!("leantest:{s}"));
         }
         let expect: Vec<Option<Vec<u8>>> = pipe.query(&mut rc).unwrap();
-        assert_eq!(out, expect, "lean fetch must match redis-rs byte for byte");
+        let mut out = Vec::new();
+        let mut t = None;
+        for wait in [LeanWait::Poll, LeanWait::Spin(30), LeanWait::Sequential] {
+            let l = LeanCluster::new(vec![seed.clone()], timeout, 2, wait);
+            for _ in 0..50 {
+                l.fetch("leantest:", &slots, &mut out, |b| Some(b.to_vec()), &mut t).unwrap();
+                assert_eq!(out, expect, "{wait:?}: lean fetch must match redis-rs byte for byte");
+            }
+        }
+        let lean = LeanCluster::new(vec![seed.clone()], timeout, 2, LeanWait::Sequential);
+        assert!(lean.slot_map().nodes.len() >= 2, "expected a multi-node cluster");
+        lean.fetch("leantest:", &slots, &mut out, |b| Some(b.to_vec()), &mut t).unwrap();
+        assert_eq!(out, expect);
         assert!(t.is_some());
 
         // A stale table (every slot pointed at one node) must produce MOVED -> an error, never
@@ -716,6 +928,7 @@ mod tests {
             key_prefix: "leanstore:".to_string(),
             cluster: true,
             lean_fetch,
+            lean_wait: LeanWait::Sequential,
         };
         let lean = GarnetFpStore::<f32>::connect(&cfg(true), dim, 5000, 1).unwrap();
         let plain = GarnetFpStore::<f32>::connect(&cfg(false), dim, 5000, 1).unwrap();
@@ -790,6 +1003,7 @@ mod tests {
             key_prefix: "leandown:".to_string(),
             cluster: true,
             lean_fetch: true,
+            lean_wait: LeanWait::Poll,
         };
         let store = GarnetFpStore::<f32>::connect(&cfg, dim, 5000, 1).unwrap();
         let ids: Vec<usize> = (0..100).collect();
@@ -835,10 +1049,11 @@ mod bench {
     #[test]
     #[ignore]
     fn lean_vs_redis_rs() {
+        use super::LeanWait;
         use crate::fp_store::{FpVectorStore, GarnetConfig, GarnetFpStore};
         let seed = std::env::var("LEAN_TEST_CLUSTER").expect("set LEAN_TEST_CLUSTER=host:port");
         let dim = 100;
-        let cfg = |lean_fetch| GarnetConfig {
+        let cfg = |lean_fetch, lean_wait| GarnetConfig {
             endpoints: vec![seed.clone()],
             timeout_ms: 1000,
             pool_size: 1,
@@ -846,24 +1061,42 @@ mod bench {
             key_prefix: "leanbench:".to_string(),
             cluster: true,
             lean_fetch,
+            lean_wait,
         };
-        let lean = GarnetFpStore::<f32>::connect(&cfg(true), dim, 100_000, 1).unwrap();
-        let plain = GarnetFpStore::<f32>::connect(&cfg(false), dim, 100_000, 1).unwrap();
+        let lean = GarnetFpStore::<f32>::connect(&cfg(true, LeanWait::Sequential), dim, 100_000, 1).unwrap();
+        let polled = GarnetFpStore::<f32>::connect(&cfg(true, LeanWait::Poll), dim, 100_000, 1).unwrap();
+        let spun = GarnetFpStore::<f32>::connect(&cfg(true, LeanWait::Spin(50)), dim, 100_000, 1).unwrap();
+        let plain = GarnetFpStore::<f32>::connect(&cfg(false, LeanWait::Sequential), dim, 100_000, 1).unwrap();
         let ids: Vec<usize> = (0..100).map(|i| i * 997 % 100_000).collect();
         for &i in &ids {
             plain.set_vector_sync(i, &vec![i as f32; dim]).unwrap();
         }
-        for (name, s) in [("redis-rs", &plain), ("lean", &lean), ("redis-rs", &plain), ("lean", &lean)] {
+        for (name, s) in [
+            ("redis-rs", &plain),
+            ("lean/seq", &lean),
+            ("lean/poll", &polled),
+            ("lean/spin", &spun),
+            ("redis-rs", &plain),
+            ("lean/seq", &lean),
+            ("lean/poll", &polled),
+            ("lean/spin", &spun),
+        ] {
             let mut out = Vec::new();
             for _ in 0..200 {
                 s.get_many(&ids, &mut out).unwrap();
             }
             let n = 3000;
+            let before = crate::fp_store::fp_fetch_stats();
             let t = std::time::Instant::now();
             for _ in 0..n {
                 s.get_many(&ids, &mut out).unwrap();
             }
-            println!("{name:>8}: {:.1} us per 100-key fetch", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+            let d = crate::fp_store::fp_fetch_stats().since(&before);
+            println!(
+                "{name:>9}: {:.1} us per 100-key fetch, {:.2} sleeps per lean fetch",
+                t.elapsed().as_secs_f64() * 1e6 / n as f64,
+                d.lean_sleeps as f64 / d.lean_fetches.max(1) as f64
+            );
         }
     }
 }

@@ -27,6 +27,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
+[target.'cfg(unix)'.dependencies]
+# poll(2) and MSG_DONTWAIT for the lean cluster fetch's `poll` / `spin` wait modes.
+libc = "0.2"
+
 [dev-dependencies]
 diskann = { workspace = true, features = ["testing"] }
 diskann-providers = { workspace = true, features = ["testing"] }

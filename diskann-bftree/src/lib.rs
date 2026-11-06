@@ -17,6 +17,7 @@ pub mod vectors;
 
 mod fp_store;
 mod lean_fetch;
+pub use lean_fetch::LeanWait;
 mod locks;
 
 pub use fp_store::{fp_fetch_stats, FpBackendSelection, FpFetchStats, GarnetConfig, HistogramSnapshot};

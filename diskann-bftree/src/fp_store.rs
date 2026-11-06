@@ -257,6 +257,9 @@ pub struct GarnetConfig {
     /// fetch that hits a redirection, error or timeout. Ignored in standalone mode and for
     /// TLS/authenticated endpoints. Writes always use redis-rs.
     pub lean_fetch: bool,
+    /// How the lean fetch waits for the nodes' replies (`sequential`, `poll`, `spin:<us>`); see
+    /// [`crate::LeanWait`]. Only used with `cluster` and `lean_fetch`.
+    pub lean_wait: crate::lean_fetch::LeanWait,
 }
 
 /// Which backend stores the full-precision vectors — the user-facing selection carried in
@@ -437,7 +440,7 @@ impl<T: VectorRepr> GarnetFpStore<T> {
         let lean = if cfg.cluster && cfg.lean_fetch {
             let seeds: Option<Vec<String>> =
                 cfg.endpoints.iter().map(|e| crate::lean_fetch::lean_seed(e)).collect();
-            seeds.map(|seeds| crate::lean_fetch::LeanCluster::new(seeds, timeout, pool_size))
+            seeds.map(|seeds| crate::lean_fetch::LeanCluster::new(seeds, timeout, pool_size, cfg.lean_wait))
         } else {
             None
         };
@@ -633,6 +636,7 @@ impl<T: VectorRepr> FpVectorStore<T> for GarnetFpStore<T> {
                     self.breaker.on_success();
                     LEAN_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(t) = timing {
+                        LEAN_SLEEPS.fetch_add(t.sleeps as u64, std::sync::atomic::Ordering::Relaxed);
                         FETCH_CHECKOUT.record(t.checked_out - t_enter);
                         FETCH_PREP.record(t.prepared - t.checked_out);
                         FETCH_CALL.record(t.received - t.prepared);
@@ -1009,6 +1013,9 @@ pub struct FpFetchStats {
     pub lean_fetches: u64,
     /// Garnet cluster only: lean fetches that fell back to redis-rs (redirection, error, timeout).
     pub lean_fallbacks: u64,
+    /// Garnet cluster only: times a lean fetch's thread slept waiting for replies (summed;
+    /// divide by `lean_fetches` for the average per fetch).
+    pub lean_sleeps: u64,
 }
 
 impl FpFetchStats {
@@ -1022,6 +1029,7 @@ impl FpFetchStats {
             decode: self.decode.since(&earlier.decode),
             lean_fetches: self.lean_fetches.saturating_sub(earlier.lean_fetches),
             lean_fallbacks: self.lean_fallbacks.saturating_sub(earlier.lean_fallbacks),
+            lean_sleeps: self.lean_sleeps.saturating_sub(earlier.lean_sleeps),
         }
     }
 }
@@ -1033,6 +1041,7 @@ static FETCH_CALL: LatencyHistogram = LatencyHistogram::new();
 static FETCH_DECODE: LatencyHistogram = LatencyHistogram::new();
 static LEAN_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LEAN_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LEAN_SLEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cumulative (since process start) rerank FP-fetch timing.
 pub fn fp_fetch_stats() -> FpFetchStats {
@@ -1044,5 +1053,6 @@ pub fn fp_fetch_stats() -> FpFetchStats {
         decode: FETCH_DECODE.snapshot(),
         lean_fetches: LEAN_FETCHES.load(std::sync::atomic::Ordering::Relaxed),
         lean_fallbacks: LEAN_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+        lean_sleeps: LEAN_SLEEPS.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
