@@ -22,6 +22,11 @@
 //! serves this fetch through the regular redis-rs path, which handles redirections and retries, and
 //! the slot table is refreshed (rate-limited). Writes never use this path.
 //!
+//! The same reader also serves **standalone** (single-node) mode: one "node" owning every slot, no
+//! `CLUSTER SLOTS`, the keys sent as one pipeline of `GET`s (Garnet serves 100 pipelined `GET`s as
+//! fast as one 100-key `MGET`). There it replaces redis-rs's blocking `MGET`, so the `LeanWait`
+//! modes (spinning) apply to single-node deployments too.
+//!
 //! Not supported (the lean path disables itself and everything goes through redis-rs): TLS
 //! (`rediss://`) and authenticated endpoints.
 
@@ -144,6 +149,11 @@ pub(crate) struct SlotMap {
 impl SlotMap {
     fn empty(generation: u64) -> Self {
         Self { nodes: Vec::new(), owner: vec![UNCOVERED; NUM_SLOTS], generation }
+    }
+
+    /// Standalone server: one node serves every key.
+    fn single(addr: String, generation: u64) -> Self {
+        Self { nodes: vec![addr], owner: vec![0; NUM_SLOTS], generation }
     }
 
     /// Build from a `CLUSTER SLOTS` reply: `[[start, end, [host, port, id, ...], replicas...], ...]`.
@@ -392,14 +402,24 @@ impl LeanConn {
     }
 }
 
-fn connect(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+fn connect(addr: &str, db: i64, timeout: Duration) -> std::io::Result<TcpStream> {
     let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, format!("cannot resolve {addr}"));
     for sa in addr.to_socket_addrs()? {
         match TcpStream::connect_timeout(&sa, timeout) {
-            Ok(s) => {
+            Ok(mut s) => {
                 s.set_nodelay(true)?;
                 s.set_read_timeout(Some(timeout))?;
                 s.set_write_timeout(Some(timeout))?;
+                if db != 0 {
+                    // Standalone endpoint with a database number (redis://host:port/<db>).
+                    let db = db.to_string();
+                    s.write_all(format!("*2\r\n$6\r\nSELECT\r\n${}\r\n{db}\r\n", db.len()).as_bytes())?;
+                    let mut ok = [0u8; 5];
+                    s.read_exact(&mut ok)?;
+                    if &ok != b"+OK\r\n" {
+                        return Err(std::io::Error::other(format!("SELECT {db} failed on {addr}")));
+                    }
+                }
                 return Ok(s);
             }
             Err(e) => last = e,
@@ -421,6 +441,10 @@ pub(crate) struct LeanTiming {
 /// The lean fetch path of one `GarnetFpStore` (cluster mode).
 pub(crate) struct LeanCluster {
     seeds: Vec<String>,
+    /// Standalone server: the slot table is fixed (one node) and never refreshed.
+    single: bool,
+    /// Database to `SELECT` on each new connection (standalone only; always 0 in a cluster).
+    db: i64,
     map: RwLock<Arc<SlotMap>>,
     last_refresh: Mutex<Option<Instant>>,
     timeout: Duration,
@@ -438,6 +462,8 @@ impl LeanCluster {
         let wait = if cfg!(unix) { wait } else { LeanWait::Sequential };
         let me = Self {
             seeds,
+            single: false,
+            db: 0,
             map: RwLock::new(Arc::new(SlotMap::empty(0))),
             last_refresh: Mutex::new(None),
             timeout,
@@ -448,6 +474,23 @@ impl LeanCluster {
         };
         me.refresh();
         me
+    }
+
+    /// Standalone server at `addr` (`host:port`), database `db`.
+    pub(crate) fn new_single(addr: String, db: i64, timeout: Duration, pool_size: usize, wait: LeanWait) -> Self {
+        let wait = if cfg!(unix) { wait } else { LeanWait::Sequential };
+        Self {
+            seeds: vec![addr.clone()],
+            single: true,
+            db,
+            map: RwLock::new(Arc::new(SlotMap::single(addr, 1))),
+            last_refresh: Mutex::new(None),
+            timeout,
+            wait,
+            pool: (0..pool_size.max(1)).map(|_| Mutex::new(LeanConn::new())).collect(),
+            next: AtomicUsize::new(0),
+            generation: AtomicU64::new(1),
+        }
     }
 
     /// Current slot table.
@@ -462,6 +505,9 @@ impl LeanCluster {
     /// another thread is already refreshing (search threads never queue up behind a refresh).
     /// Returns whether a new table was installed.
     pub(crate) fn refresh(&self) -> bool {
+        if self.single {
+            return false; // one fixed node: nothing to re-read (failed sockets are already dropped)
+        }
         let mut last = match self.last_refresh.try_lock() {
             Ok(g) => g,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
@@ -515,8 +561,9 @@ impl LeanCluster {
         let checked_out = Instant::now();
         let conn = &mut *guard;
         conn.adopt(&map);
-        let result =
-            Self::fetch_on(conn, &map, self.timeout, self.wait, prefix, slots, out, decode, checked_out, timing);
+        let result = Self::fetch_on(
+            conn, &map, self.timeout, self.wait, self.db, prefix, slots, out, decode, checked_out, timing,
+        );
         if result.is_err() {
             conn.poison();
         }
@@ -529,6 +576,7 @@ impl LeanCluster {
         map: &SlotMap,
         timeout: Duration,
         wait: LeanWait,
+        db: i64,
         prefix: &str,
         slots: &[usize],
         out: &mut Vec<Option<V>>,
@@ -562,7 +610,7 @@ impl LeanCluster {
                 continue;
             }
             if conn.socks[n].is_none() {
-                conn.socks[n] = Some(connect(&map.nodes[n], timeout).map_err(LeanError::Io)?);
+                conn.socks[n] = Some(connect(&map.nodes[n], db, timeout).map_err(LeanError::Io)?);
             }
             let sock = conn.socks[n].as_mut().expect("socket just ensured");
             sock.write_all(&conn.req[n]).map_err(LeanError::Io)?;
@@ -758,7 +806,7 @@ fn read_polling(
 
 /// Seed `host:port` for the lean path from a configured endpoint, or `None` if the endpoint needs
 /// something the lean path does not do (TLS, authentication, unix socket).
-pub(crate) fn lean_seed(endpoint: &str) -> Option<String> {
+pub(crate) fn lean_seed(endpoint: &str) -> Option<(String, i64)> {
     use redis::IntoConnectionInfo;
     let url = if endpoint.contains("://") { endpoint.to_string() } else { format!("redis://{endpoint}") };
     let info = url.as_str().into_connection_info().ok()?;
@@ -766,7 +814,7 @@ pub(crate) fn lean_seed(endpoint: &str) -> Option<String> {
         return None;
     }
     match info.addr {
-        redis::ConnectionAddr::Tcp(host, port) => Some(format!("{host}:{port}")),
+        redis::ConnectionAddr::Tcp(host, port) => Some((format!("{host}:{port}"), info.redis.db)),
         _ => None,
     }
 }
@@ -846,9 +894,19 @@ mod tests {
     }
 
     #[test]
+    fn single_node_map_routes_everything_to_one_node() {
+        let m = SlotMap::single("h:1".to_string(), 1);
+        assert_eq!(m.nodes, vec!["h:1"]);
+        for slot in [0u16, 1, 8191, 16383] {
+            assert_eq!(m.node_of(slot), Some(0));
+        }
+    }
+
+    #[test]
     fn seeds_from_endpoints() {
-        assert_eq!(lean_seed("10.0.0.1:6379").as_deref(), Some("10.0.0.1:6379"));
-        assert_eq!(lean_seed("redis://10.0.0.1:6380").as_deref(), Some("10.0.0.1:6380"));
+        assert_eq!(lean_seed("10.0.0.1:6379"), Some(("10.0.0.1:6379".to_string(), 0)));
+        assert_eq!(lean_seed("redis://10.0.0.1:6380"), Some(("10.0.0.1:6380".to_string(), 0)));
+        assert_eq!(lean_seed("redis://10.0.0.1:6380/3"), Some(("10.0.0.1:6380".to_string(), 3)));
         assert_eq!(lean_seed("redis://:secret@10.0.0.1:6379"), None);
     }
 
@@ -992,7 +1050,11 @@ mod tests {
     #[ignore]
     fn store_node_down_then_back() {
         use crate::fp_store::{FpVectorStore, GarnetConfig, GarnetFpStore};
-        let seed = std::env::var("LEAN_TEST_CLUSTER").expect("set LEAN_TEST_CLUSTER=host:port");
+        // LEAN_TEST_DOWN_SINGLE=host:port runs the same scenario against a standalone server.
+        let single = std::env::var("LEAN_TEST_DOWN_SINGLE").ok();
+        let seed = single
+            .clone()
+            .unwrap_or_else(|| std::env::var("LEAN_TEST_CLUSTER").expect("set LEAN_TEST_CLUSTER=host:port"));
         let restart = std::env::var("LEAN_TEST_RESTART").expect("set LEAN_TEST_RESTART");
         let dim = 100;
         let cfg = GarnetConfig {
@@ -1001,7 +1063,7 @@ mod tests {
             pool_size: 2,
             breaker_threshold: 1000,
             key_prefix: "leandown:".to_string(),
-            cluster: true,
+            cluster: single.is_none(),
             lean_fetch: true,
             lean_wait: LeanWait::Poll,
         };
@@ -1039,6 +1101,56 @@ mod tests {
         store.get_many(&ids, &mut out).unwrap();
         let after = crate::fp_store::fp_fetch_stats().since(&before);
         assert_eq!((after.lean_fetches, after.lean_fallbacks), (1, 0), "lean path back in use");
+    }
+
+    /// Standalone (single-node) lean fetch through `GarnetFpStore`, lean vs redis-rs `MGET`, in
+    /// every wait mode and with a database number: `LEAN_TEST_SINGLE=host:port cargo test -p
+    /// diskann-bftree lean_fetch::tests::store_single -- --ignored`. Writes `leansingle:*` in db 0
+    /// and db 3.
+    #[test]
+    #[ignore]
+    fn store_single_node_lean_matches_mget() {
+        use crate::fp_store::{FpVectorStore, GarnetConfig, GarnetFpStore};
+        let addr = std::env::var("LEAN_TEST_SINGLE").expect("set LEAN_TEST_SINGLE=host:port");
+        let dim = 100;
+        for endpoint in [addr.clone(), format!("redis://{addr}/3")] {
+            let cfg = |lean_fetch, lean_wait| GarnetConfig {
+                endpoints: vec![endpoint.clone()],
+                timeout_ms: 1000,
+                pool_size: 2,
+                breaker_threshold: 20,
+                key_prefix: "leansingle:".to_string(),
+                cluster: false,
+                lean_fetch,
+                lean_wait,
+            };
+            let plain = GarnetFpStore::<f32>::connect(&cfg(false, LeanWait::Sequential), dim, 5000, 1).unwrap();
+            assert!(plain.lean.is_none());
+            let ids: Vec<usize> = (0..500).collect();
+            for &i in &ids {
+                if i % 9 == 4 {
+                    plain.delete_vector(i);
+                } else {
+                    let v: Vec<f32> = (0..dim).map(|d| (i * 7 + d) as f32 + if endpoint.ends_with("/3") { 0.5 } else { 0.0 }).collect();
+                    plain.set_vector_sync(i, &v).unwrap();
+                }
+            }
+            let mut expect = Vec::new();
+            plain.get_many(&ids, &mut expect).unwrap();
+            assert!(expect.iter().any(|v| v.is_none()) && expect.iter().any(|v| v.is_some()));
+            for wait in [LeanWait::Sequential, LeanWait::Poll, LeanWait::Spin(200)] {
+                let lean = GarnetFpStore::<f32>::connect(&cfg(true, wait), dim, 5000, 1).unwrap();
+                assert!(lean.lean.is_some(), "standalone lean path must be enabled");
+                let before = crate::fp_store::fp_fetch_stats();
+                for _ in 0..20 {
+                    let mut out = Vec::new();
+                    lean.get_many(&ids, &mut out).unwrap();
+                    assert_eq!(out, expect, "{endpoint} {wait:?}: lean must match MGET");
+                }
+                let d = crate::fp_store::fp_fetch_stats().since(&before);
+                assert_eq!((d.lean_fetches, d.lean_fallbacks), (20, 0), "{endpoint} {wait:?}");
+            }
+        }
     }
 }
 
@@ -1081,6 +1193,55 @@ mod bench {
             ("lean/poll", &polled),
             ("lean/spin", &spun),
         ] {
+            let mut out = Vec::new();
+            for _ in 0..200 {
+                s.get_many(&ids, &mut out).unwrap();
+            }
+            let n = 3000;
+            let before = crate::fp_store::fp_fetch_stats();
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                s.get_many(&ids, &mut out).unwrap();
+            }
+            let d = crate::fp_store::fp_fetch_stats().since(&before);
+            println!(
+                "{name:>9}: {:.1} us per 100-key fetch, {:.2} sleeps per lean fetch",
+                t.elapsed().as_secs_f64() * 1e6 / n as f64,
+                d.lean_sleeps as f64 / d.lean_fetches.max(1) as f64
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench_single {
+    /// Rough single-thread timing on a standalone server, lean vs redis-rs `MGET`:
+    /// `LEAN_TEST_SINGLE=host:port cargo test --release -p diskann-bftree lean_fetch::bench_single -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn lean_vs_mget() {
+        use super::LeanWait;
+        use crate::fp_store::{FpVectorStore, GarnetConfig, GarnetFpStore};
+        let addr = std::env::var("LEAN_TEST_SINGLE").expect("set LEAN_TEST_SINGLE=host:port");
+        let dim = 100;
+        let cfg = |lean_fetch, lean_wait| GarnetConfig {
+            endpoints: vec![addr.clone()],
+            timeout_ms: 1000,
+            pool_size: 1,
+            breaker_threshold: 20,
+            key_prefix: "leanbench1:".to_string(),
+            cluster: false,
+            lean_fetch,
+            lean_wait,
+        };
+        let plain = GarnetFpStore::<f32>::connect(&cfg(false, LeanWait::Sequential), dim, 100_000, 1).unwrap();
+        let seq = GarnetFpStore::<f32>::connect(&cfg(true, LeanWait::Sequential), dim, 100_000, 1).unwrap();
+        let spin = GarnetFpStore::<f32>::connect(&cfg(true, LeanWait::Spin(300)), dim, 100_000, 1).unwrap();
+        let ids: Vec<usize> = (0..100).map(|i| i * 997 % 100_000).collect();
+        for &i in &ids {
+            plain.set_vector_sync(i, &vec![i as f32; dim]).unwrap();
+        }
+        for (name, s) in [("mget", &plain), ("lean/seq", &seq), ("lean/spin", &spin), ("mget", &plain), ("lean/seq", &seq), ("lean/spin", &spin)] {
             let mut out = Vec::new();
             for _ in 0..200 {
                 s.get_many(&ids, &mut out).unwrap();

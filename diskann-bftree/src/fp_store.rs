@@ -252,13 +252,14 @@ pub struct GarnetConfig {
     /// survives any listed seed being down). The cluster client follows redirections, tracks
     /// topology changes, and splits multi-key MGETs per owning node.
     pub cluster: bool,
-    /// Cluster mode only: serve the rerank fetch through the lean per-node reader
-    /// (`lean_fetch.rs`) instead of redis-rs's cluster pipeline. Falls back to redis-rs for any
-    /// fetch that hits a redirection, error or timeout. Ignored in standalone mode and for
-    /// TLS/authenticated endpoints. Writes always use redis-rs.
+    /// Serve the rerank fetch through the lean reader (`lean_fetch.rs`) instead of redis-rs —
+    /// per-node pipelined `GET`s in cluster mode (instead of redis-rs's cluster pipeline), one
+    /// pipeline of `GET`s in standalone mode (instead of redis-rs's `MGET`). Falls back to redis-rs
+    /// for any fetch that hits a redirection, error or timeout. Ignored for TLS/authenticated
+    /// endpoints. Writes always use redis-rs.
     pub lean_fetch: bool,
-    /// How the lean fetch waits for the nodes' replies (`sequential`, `poll`, `spin:<us>`); see
-    /// [`crate::LeanWait`]. Only used with `cluster` and `lean_fetch`.
+    /// How the lean fetch waits for replies (`sequential`, `poll`, `spin:<us>`); see
+    /// [`crate::LeanWait`]. Used whenever `lean_fetch` is on (cluster or standalone).
     pub lean_wait: crate::lean_fetch::LeanWait,
 }
 
@@ -437,12 +438,21 @@ impl<T: VectorRepr> GarnetFpStore<T> {
         }
 
         // Lean fetch: every endpoint must be plain TCP without auth, else stay on redis-rs.
-        let lean = if cfg.cluster && cfg.lean_fetch {
-            let seeds: Option<Vec<String>> =
-                cfg.endpoints.iter().map(|e| crate::lean_fetch::lean_seed(e)).collect();
-            seeds.map(|seeds| crate::lean_fetch::LeanCluster::new(seeds, timeout, pool_size, cfg.lean_wait))
-        } else {
+        let lean = if !cfg.lean_fetch {
             None
+        } else if cfg.cluster {
+            // A cluster has only database 0; any other number means a misconfigured URL — leave it
+            // to redis-rs to report.
+            let seeds: Option<Vec<(String, i64)>> =
+                cfg.endpoints.iter().map(|e| crate::lean_fetch::lean_seed(e)).collect();
+            seeds.filter(|s| s.iter().all(|(_, db)| *db == 0)).map(|s| {
+                let seeds = s.into_iter().map(|(a, _)| a).collect();
+                crate::lean_fetch::LeanCluster::new(seeds, timeout, pool_size, cfg.lean_wait)
+            })
+        } else {
+            crate::lean_fetch::lean_seed(&cfg.endpoints[0]).map(|(addr, db)| {
+                crate::lean_fetch::LeanCluster::new_single(addr, db, timeout, pool_size, cfg.lean_wait)
+            })
         };
 
         Ok(Self {
@@ -1009,11 +1019,11 @@ pub struct FpFetchStats {
     pub call: HistogramSnapshot,
     /// Garnet only: copying each value into a `Vec<T>`.
     pub decode: HistogramSnapshot,
-    /// Garnet cluster only: fetches served by the lean per-node reader.
+    /// Garnet only: fetches served by the lean reader.
     pub lean_fetches: u64,
-    /// Garnet cluster only: lean fetches that fell back to redis-rs (redirection, error, timeout).
+    /// Garnet only: lean fetches that fell back to redis-rs (redirection, error, timeout).
     pub lean_fallbacks: u64,
-    /// Garnet cluster only: times a lean fetch's thread slept waiting for replies (summed;
+    /// Garnet only: times a lean fetch's thread slept waiting for replies (summed;
     /// divide by `lean_fetches` for the average per fetch).
     pub lean_sleeps: u64,
 }
