@@ -246,6 +246,7 @@ fn bftree_parameters_from(
         quant_vector_provider_config: quant_store_config.clone().unwrap_or_default().into_config(),
         graph_params: None,
         use_snapshot,
+        fp_backend: diskann_bftree::FpBackendSelection::default(),
     })
 }
 
