@@ -132,6 +132,14 @@ impl QuantVectorProvider {
         Ok(())
     }
 
+    /// Hint the CPU to start loading slot `i`'s code from the cache. No-op without a cache.
+    #[inline]
+    pub(crate) fn prefetch(&self, i: usize) {
+        if let Some(c) = &self.cache {
+            c.prefetch(i);
+        }
+    }
+
     /// Liveness of slot `i` from the cache without copying its code; `None` when the cache is
     /// disabled or `i` is outside it (callers then fall back to a full read).
     pub(crate) fn cached_liveness(&self, i: usize) -> Option<bool> {

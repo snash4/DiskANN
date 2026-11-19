@@ -1001,6 +1001,10 @@ where
 // QuantAccessor //
 ///////////////////
 
+/// How many neighbors ahead to prefetch from the in-memory quant cache during a hop (the default
+/// of DiskANN's in-memory stores).
+const QUANT_PREFETCH_LOOKAHEAD: usize = 8;
+
 /// An accessor that retrieves the quantized portion of the [`BfTreeProvider`].
 ///
 /// This type implements [`glue::SearchAccessor`] for the [`BfTreeProvider`].
@@ -1093,9 +1097,28 @@ where
         F: FnMut(Self::Id, f32) + Send,
     {
         let mut neighbors = AdjacencyList::new();
+        let quant = &self.provider.quant_vectors;
+        let lookahead = if quant.cache_enabled() {
+            QUANT_PREFETCH_LOOKAHEAD
+        } else {
+            0
+        };
         for n in ids {
             self.provider.neighbors().get_neighbors(n, &mut neighbors)?;
-            for &id in neighbors.iter().filter(|i| pred.eval_mut(i)) {
+            neighbors.retain(|i| pred.eval_mut(i));
+            let len = neighbors.len();
+
+            // With the in-memory quant cache, keep `lookahead` slots in flight so their cache
+            // misses overlap (as DiskANN's in-memory stores do); bf-tree reads cannot be
+            // prefetched, so without the cache this is skipped.
+            for id in neighbors.iter().take(lookahead) {
+                quant.prefetch(id.as_index());
+            }
+            for k in 0..len {
+                if lookahead > 0 && k + lookahead < len {
+                    quant.prefetch(neighbors[k + lookahead].as_index());
+                }
+                let id = neighbors[k];
                 if let Some(distance) = self
                     .get_distance(id)
                     .allow_transient("skipping deleted vectors")?
@@ -1292,6 +1315,13 @@ where
     {
         let mut buf: Option<Box<[u8]>> = None;
         let bytes = self.provider.quant_vectors.quantizer.bytes();
+
+        // Start loading every requested slot before copying them out (no-op without the cache).
+        if self.provider.quant_vectors.cache_enabled() {
+            for i in itr.clone() {
+                self.provider.quant_vectors.prefetch(i.as_index());
+            }
+        }
 
         let view = self.set.fill(itr, |i: I| -> ANNResult<_> {
             let mut b = match buf.take() {
