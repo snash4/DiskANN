@@ -166,7 +166,15 @@ impl Benchmark for BfTreeSpherical {
             .build()
             .start_point_strategy()
             .compute(data.as_view())?;
-        let provider = BfTreeProvider::new(params, start_points.as_view(), quantizer_poly)?;
+        let mut provider = BfTreeProvider::new(params, start_points.as_view(), quantizer_poly)?;
+        if input.quant_cache() {
+            provider.enable_quant_cache()?;
+            writeln!(
+                output,
+                "Quant cache: enabled ({:.1} MiB)",
+                provider.quant_cache_bytes() as f64 / (1u64 << 20) as f64
+            )?;
+        }
         let index = Arc::new(DiskANNIndex::new(config, provider, None));
 
         // 4. Insert all vectors using Quantized strategy.

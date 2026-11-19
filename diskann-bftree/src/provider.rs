@@ -450,6 +450,27 @@ where
             self.quant_vectors.num_get_calls.get(),
         )
     }
+
+    /// Serve quantized-code reads from a slot-indexed in-memory array instead of the bf-tree
+    /// quant store (which stays the store of record: snapshots and recovery are unchanged).
+    ///
+    /// Call after [`BfTreeProvider::new`] or a load, before wrapping the provider in an index;
+    /// it fills the array from the quant bf-tree for every slot (`max_points` + start points).
+    /// Costs about `slots × code bytes` of memory (e.g. ~4 GB for 10M slots of 392-byte codes).
+    pub fn enable_quant_cache(&mut self) -> ANNResult<()> {
+        let capacity = self.full_vectors.total();
+        self.quant_vectors.enable_cache(capacity)
+    }
+
+    /// Whether quantized-code reads are served from the in-memory array.
+    pub fn quant_cache_enabled(&self) -> bool {
+        self.quant_vectors.cache_enabled()
+    }
+
+    /// Bytes reserved by the quantized-code array (0 when disabled).
+    pub fn quant_cache_bytes(&self) -> usize {
+        self.quant_vectors.cache_bytes()
+    }
 }
 
 impl<T, I> BfTreeProvider<T, NoStore, I>
@@ -483,6 +504,9 @@ impl DeleteQuant for QuantVectorProvider {
     }
 
     fn is_present(&self, id: usize) -> Option<ANNResult<bool>> {
+        if let Some(live) = self.cached_liveness(id) {
+            return Some(Ok(live));
+        }
         let mut buf = vec![0u8; self.quantizer.bytes()];
         Some(match self.get_vector_into(id, &mut buf) {
             Ok(()) => Ok(true),
@@ -3964,6 +3988,271 @@ mod tests {
         assert!(
             result.is_err(),
             "u32 provider must reject a capacity exceeding u32::MAX"
+        );
+    }
+
+    // ---- quantized-code array cache ------------------------------------------------------------
+
+    fn create_quant_index_with_cache(
+        cache: bool,
+        max_points: usize,
+    ) -> Arc<DiskANNIndex<BfTreeProvider<f32, QuantVectorProvider>>> {
+        let dim = 5;
+        let start_point = Matrix::new(Init(|| 0.0f32), 1, dim);
+        let logical_max_degree = 6;
+        let physical_max_degree = (logical_max_degree as f32 * 1.3) as u32;
+        let metric = Metric::L2;
+
+        let mut provider = BfTreeProvider::new(
+            BfTreeProviderParameters {
+                fp_backend: Default::default(),
+                max_points,
+                num_start_points: NonZeroUsize::new(1).unwrap(),
+                dim,
+                metric,
+                max_degree: physical_max_degree,
+                vector_provider_config: Config::default(),
+                quant_vector_provider_config: Config::default(),
+                neighbor_list_provider_config: Config::default(),
+                graph_params: None,
+                use_snapshot: false,
+            },
+            start_point.as_view(),
+            create_test_quantizer(dim),
+        )
+        .unwrap();
+        if cache {
+            provider.enable_quant_cache().unwrap();
+            assert!(provider.quant_cache_enabled());
+            assert!(provider.quant_cache_bytes() > 0);
+        } else {
+            assert!(!provider.quant_cache_enabled());
+            assert_eq!(provider.quant_cache_bytes(), 0);
+        }
+
+        let index_config = graph::config::Builder::new_with(
+            logical_max_degree as usize,
+            graph::config::MaxDegree::new(physical_max_degree as usize),
+            10,
+            metric.into(),
+            |_| {},
+        )
+        .build()
+        .unwrap();
+
+        Arc::new(DiskANNIndex::new(index_config, provider, None))
+    }
+
+    fn cache_test_point(i: u32) -> Vec<f32> {
+        // Deterministic, spread-out points.
+        (0..5)
+            .map(|j| ((i * 37 + j * 11) % 23) as f32 * 0.5 - 5.0)
+            .collect()
+    }
+
+    /// Asserts that every slot reads the same through the cache as straight from the bf-tree.
+    fn assert_cache_matches_bftree(provider: &BfTreeProvider<f32, QuantVectorProvider>) {
+        let q = &provider.quant_vectors;
+        let n = provider.full_vectors.total();
+        let bytes = q.quantizer.bytes();
+        let (mut a, mut b) = (vec![0u8; bytes], vec![0u8; bytes]);
+        for i in 0..n {
+            let via_cache = q.get_vector_into(i, &mut a);
+            let via_tree = q.read_bftree_into(i, &mut b);
+            match (via_cache, via_tree) {
+                (Ok(()), Ok(())) => assert_eq!(a, b, "code mismatch at slot {i}"),
+                (Err(RankedError::Transient(x)), Err(RankedError::Transient(y))) => {
+                    assert_eq!(
+                        format!("{:?}", x.err),
+                        format!("{:?}", y.err),
+                        "status mismatch at slot {i}"
+                    )
+                }
+                (x, y) => panic!("slot {i}: cache {x:?} vs bf-tree {y:?}"),
+            }
+        }
+    }
+
+    async fn search_ids(
+        index: &DiskANNIndex<BfTreeProvider<f32, QuantVectorProvider>>,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<(u32, f32)> {
+        let mut neighbors = vec![Neighbor::<u32>::default(); k];
+        let res = index
+            .search(
+                Knn::new(20, None).unwrap(),
+                &Quantized,
+                &DefaultContext,
+                query,
+                &mut BackInserter::new(neighbors.as_mut_slice()),
+            )
+            .await
+            .unwrap();
+        neighbors
+            .iter()
+            .take(res.result_count as usize)
+            .map(|n| (*n.id(), *n.distance()))
+            .collect()
+    }
+
+    /// With identical inserts, an index with the cache returns exactly what the bf-tree-only
+    /// index returns (same graph, same codes, same distances).
+    #[tokio::test]
+    async fn test_quant_cache_search_matches_bftree() {
+        let plain = create_quant_index_with_cache(false, 60);
+        let cached = create_quant_index_with_cache(true, 60);
+        let ctx = &DefaultContext;
+
+        for i in 0..50u32 {
+            let p = cache_test_point(i);
+            plain
+                .insert(&Quantized, ctx, &i, p.as_slice())
+                .await
+                .unwrap();
+            cached
+                .insert(&Quantized, ctx, &i, p.as_slice())
+                .await
+                .unwrap();
+        }
+        assert_cache_matches_bftree(cached.provider());
+
+        for qi in 0..10u32 {
+            let q = cache_test_point(qi * 7 + 3);
+            let a = search_ids(&plain, &q, 5).await;
+            let b = search_ids(&cached, &q, 5).await;
+            assert_eq!(a.len(), 5);
+            assert_eq!(a, b, "query {qi}");
+        }
+    }
+
+    /// Deletes are hidden from searches and liveness, and a re-inserted slot serves its new code.
+    #[tokio::test]
+    async fn test_quant_cache_delete_and_reinsert() {
+        let index = create_quant_index_with_cache(true, 20);
+        let ctx = &DefaultContext;
+
+        for i in 0..15u32 {
+            let point = vec![i as f32; 5];
+            index
+                .insert(&Quantized, ctx, &i, point.as_slice())
+                .await
+                .unwrap();
+        }
+        for id in [2u32, 4] {
+            index
+                .inplace_delete(Quantized, ctx, &id, 2, graph::InplaceDeleteMethod::OneHop)
+                .await
+                .unwrap();
+        }
+        let provider = index.provider();
+        assert_cache_matches_bftree(provider);
+        assert_eq!(
+            provider.status_by_internal_id(ctx, 2).await.unwrap(),
+            ElementStatus::Deleted
+        );
+        assert_eq!(
+            provider.status_by_internal_id(ctx, 3).await.unwrap(),
+            ElementStatus::Valid
+        );
+
+        let ids: Vec<u32> = search_ids(&index, &[3.0; 5], 5)
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(!ids.contains(&2) && !ids.contains(&4), "{ids:?}");
+
+        // Reuse slot 2 for a different vector.
+        let point = vec![100.0f32; 5];
+        index
+            .insert(&Quantized, ctx, &2u32, point.as_slice())
+            .await
+            .unwrap();
+        assert_cache_matches_bftree(index.provider());
+        assert_eq!(
+            index
+                .provider()
+                .status_by_internal_id(ctx, 2)
+                .await
+                .unwrap(),
+            ElementStatus::Valid
+        );
+        let best = search_ids(&index, &[100.0; 5], 1).await;
+        assert_eq!(best[0].0, 2);
+    }
+
+    /// After a save and load, enabling the cache fills it from the loaded quant bf-tree,
+    /// including deleted slots.
+    #[tokio::test]
+    async fn test_quant_cache_after_load() {
+        let num_points = 20usize;
+        let dim = 8usize;
+        let ctx = &DefaultContext;
+        let mut vector_config = Config::default();
+        vector_config.use_snapshot(true);
+        let mut neighbor_config = Config::default();
+        neighbor_config.use_snapshot(true);
+        let mut quant_config = Config::default();
+        quant_config.use_snapshot(true);
+
+        let start_points = Matrix::new(Init(|| 0.0f32), 1, dim);
+        let provider = BfTreeProvider::<f32, QuantVectorProvider>::new(
+            BfTreeProviderParameters {
+                fp_backend: Default::default(),
+                max_points: num_points,
+                num_start_points: NonZeroUsize::new(1).unwrap(),
+                dim,
+                metric: Metric::L2,
+                max_degree: 16,
+                vector_provider_config: vector_config,
+                quant_vector_provider_config: quant_config,
+                neighbor_list_provider_config: neighbor_config,
+                graph_params: None,
+                use_snapshot: true,
+            },
+            start_points.as_view(),
+            create_test_quantizer(dim),
+        )
+        .unwrap();
+        for i in 0..num_points {
+            let v: Vec<f32> = (0..dim).map(|j| (i * dim + j) as f32 * 0.1).collect();
+            provider.set_element(ctx, &(i as u32), &v).await.unwrap();
+        }
+        provider.delete(ctx, &2u32).await.unwrap();
+
+        let save_dir = tempdir().unwrap();
+        let prefix = save_dir
+            .path()
+            .join("cache_q")
+            .to_string_lossy()
+            .to_string();
+        let storage = FileStorageProvider;
+        provider.save_with(&storage, &prefix).await.unwrap();
+
+        let mut loaded = BfTreeProvider::<f32, QuantVectorProvider>::load_with(&storage, &prefix)
+            .await
+            .unwrap();
+        loaded.enable_quant_cache().unwrap();
+        assert!(loaded.quant_cache_enabled());
+        assert_cache_matches_bftree(&loaded);
+        for i in 0..num_points {
+            if i == 2 {
+                continue;
+            }
+            assert_eq!(
+                provider.quant_vectors.get_vector_sync(i).unwrap(),
+                loaded.quant_vectors.get_vector_sync(i).unwrap(),
+                "quant code mismatch at {i}"
+            );
+        }
+        assert_eq!(
+            loaded.status_by_internal_id(ctx, 2).await.unwrap(),
+            ElementStatus::Deleted
+        );
+        assert_eq!(
+            loaded.status_by_internal_id(ctx, 0).await.unwrap(),
+            ElementStatus::Valid
         );
     }
 }

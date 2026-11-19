@@ -473,6 +473,10 @@ pub(crate) struct BfTreeSphericalBuild {
     neighbor_store_config: Option<BfTreeStoreConfig>,
     #[serde(deserialize_with = "Deserialize::deserialize")]
     quant_store_config: Option<BfTreeStoreConfig>,
+    /// Serve quantized-code reads from a slot-indexed in-memory array in front of the quant
+    /// bf-tree (diskann-bftree `enable_quant_cache`). Optional, default false.
+    #[serde(default)]
+    quant_cache: bool,
 }
 
 impl BfTreeSphericalBuild {
@@ -527,6 +531,10 @@ impl BfTreeSphericalBuild {
         self.pre_scale.as_ref()
     }
 
+    pub(crate) fn quant_cache(&self) -> bool {
+        self.quant_cache
+    }
+
     pub(crate) fn validate(&mut self, checker: &mut Checker) -> anyhow::Result<()> {
         self.build.validate(checker)?;
         self.search_phase.validate(checker)?;
@@ -564,6 +572,7 @@ impl Example for BfTreeSphericalBuild {
             vector_store_config: None,
             neighbor_store_config: None,
             quant_store_config: None,
+            quant_cache: false,
         }
     }
 }
@@ -578,6 +587,7 @@ impl std::fmt::Display for BfTreeSphericalBuild {
         write_field!(f, "num_bits", self.num_bits)?;
         write_field!(f, "seed", self.seed)?;
         write_field!(f, "transform_kind", self.transform_kind)?;
+        write_field!(f, "quant_cache", self.quant_cache)?;
 
         writeln!(f)?;
         self.build.summarize_fields(f)?;

@@ -17,6 +17,7 @@ pub mod vectors;
 
 mod fp_store;
 mod lean_fetch;
+mod quant_cache;
 pub use lean_fetch::LeanWait;
 mod locks;
 
