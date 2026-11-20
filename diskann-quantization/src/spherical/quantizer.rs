@@ -324,10 +324,14 @@ where
     }
 
     /// Rescale the argument `v` to be in the rough dynamic range of the training dataset.
+    ///
+    /// A zero vector is left unchanged (rescaling it would divide by zero and produce NaN).
     pub fn rescale(&self, v: &mut [f32]) {
         let norm = FastL2Norm.evaluate(&*v);
-        let m = self.mean_norm.into_inner() / norm;
-        v.iter_mut().for_each(|i| *i *= m);
+        if norm != 0.0 {
+            let m = self.mean_norm.into_inner() / norm;
+            v.iter_mut().for_each(|i| *i *= m);
+        }
     }
 
     /// Private helper function to do common data pre-processing.
@@ -2270,6 +2274,33 @@ mod tests {
             test_quantizer::<4, 4, Dense>(&setup, &mut rng);
             test_quantizer::<8, 8, Dense>(&setup, &mut rng);
         }
+    }
+
+    /// A zero vector must survive `rescale` (inner-product queries are rescaled before
+    /// compression); dividing by its zero norm used to produce NaN and make every search or
+    /// insert of an all-zero vector fail with "input contains NaN".
+    #[test]
+    fn rescale_leaves_zero_vector_unchanged() {
+        let mut rng = StdRng::seed_from_u64(0x5ca1ab1e0ddba11);
+        let data = Matrix::new(views::Init(|| StandardNormal {}.sample(&mut rng)), 32, 16);
+        let quantizer = SphericalQuantizer::train(
+            data.as_view(),
+            TransformKind::Null,
+            SupportedMetric::InnerProduct,
+            PreScale::None,
+            &mut rng,
+            GlobalAllocator,
+        )
+        .unwrap();
+
+        let mut zero = vec![0.0f32; 16];
+        quantizer.rescale(&mut zero);
+        assert!(zero.iter().all(|&x| x == 0.0), "{zero:?}");
+
+        // A non-zero vector is still rescaled to the training mean norm.
+        let mut v = data.row(0).to_vec();
+        quantizer.rescale(&mut v);
+        assert!(v.iter().all(|x| x.is_finite()));
     }
 
     ////////////
